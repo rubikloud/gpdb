@@ -23,7 +23,7 @@
 #include "catalog/pg_resqueue.h"
 #include "nodes/makefuncs.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "commands/comment.h"
 #include "commands/defrem.h"
 #include "commands/queue.h"
@@ -347,10 +347,7 @@ AlterResqueueCapabilityEntry(
 
 		/* WITHOUT clause value determined in pg_resourcetype */
 		if (!bWithout)
-		{
-			bool need_free_value = false;
-			pStrVal = makeString(defGetString(defel, &need_free_value));
-		}
+			pStrVal = makeString(defGetString(defel));
 		else
 		{
 			pStrVal = NULL; /* if NULL, delete entry from

@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/execGrouping.c,v 1.22 2007/01/05 22:19:27 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/execGrouping.c,v 1.25 2007/02/06 02:59:11 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -178,29 +178,27 @@ execTuplesUnequal(TupleTableSlot *slot1,
 /*
  * execTuplesMatchPrepare
  *		Look up the equality functions needed for execTuplesMatch or
- *		execTuplesUnequal.
+ *		execTuplesUnequal, given an array of equality operator OIDs.
  *
  * The result is a palloc'd array.
  */
 FmgrInfo *
-execTuplesMatchPrepare(TupleDesc tupdesc,
-					   int numCols,
-					   AttrNumber *matchColIdx)
+execTuplesMatchPrepare(int numCols,
+					   Oid *eqOperators)
 {
-	FmgrInfo   *eqfunctions = (FmgrInfo *) palloc(numCols * sizeof(FmgrInfo));
+	FmgrInfo   *eqFunctions = (FmgrInfo *) palloc(numCols * sizeof(FmgrInfo));
 	int			i;
 
 	for (i = 0; i < numCols; i++)
 	{
-		AttrNumber	att = matchColIdx[i];
-		Oid			typid = tupdesc->attrs[att - 1]->atttypid;
+		Oid			eq_opr = eqOperators[i];
 		Oid			eq_function;
 
-		eq_function = equality_oper_funcid(typid);
-		fmgr_info(eq_function, &eqfunctions[i]);
+		eq_function = get_opcode(eq_opr);
+		fmgr_info(eq_function, &eqFunctions[i]);
 	}
 
-	return eqfunctions;
+	return eqFunctions;
 }
 
 /*
@@ -208,40 +206,38 @@ execTuplesMatchPrepare(TupleDesc tupdesc,
  *		Look up the equality and hashing functions needed for a TupleHashTable.
  *
  * This is similar to execTuplesMatchPrepare, but we also need to find the
- * hash functions associated with the equality operators.  *eqfunctions and
- * *hashfunctions receive the palloc'd result arrays.
+ * hash functions associated with the equality operators.  *eqFunctions and
+ * *hashFunctions receive the palloc'd result arrays.
+ *
+ * Note: we expect that the given operators are not cross-type comparisons.
  */
 void
-execTuplesHashPrepare(TupleDesc tupdesc,
-					  int numCols,
-					  AttrNumber *matchColIdx,
-					  FmgrInfo **eqfunctions,
-					  FmgrInfo **hashfunctions)
+execTuplesHashPrepare(int numCols,
+					  Oid *eqOperators,
+					  FmgrInfo **eqFunctions,
+					  FmgrInfo **hashFunctions)
 {
 	int			i;
 
-	*eqfunctions = (FmgrInfo *) palloc(numCols * sizeof(FmgrInfo));
-	*hashfunctions = (FmgrInfo *) palloc(numCols * sizeof(FmgrInfo));
+	*eqFunctions = (FmgrInfo *) palloc(numCols * sizeof(FmgrInfo));
+	*hashFunctions = (FmgrInfo *) palloc(numCols * sizeof(FmgrInfo));
 
 	for (i = 0; i < numCols; i++)
 	{
-		AttrNumber	att = matchColIdx[i];
-		Oid			typid = tupdesc->attrs[att - 1]->atttypid;
-		Operator	optup;
-		Oid			eq_opr;
+		Oid			eq_opr = eqOperators[i];
 		Oid			eq_function;
-		Oid			hash_function;
+		Oid			left_hash_function;
+		Oid			right_hash_function;
 
-		optup = equality_oper(typid, false);
-		eq_opr = oprid(optup);
-		eq_function = oprfuncid(optup);
-		ReleaseOperator(optup);
-		hash_function = get_op_hash_function(eq_opr);
-		if (!OidIsValid(hash_function)) /* should not happen */
+		eq_function = get_opcode(eq_opr);
+		if (!get_op_hash_functions(eq_opr,
+								   &left_hash_function, &right_hash_function))
 			elog(ERROR, "could not find hash function for hash operator %u",
 				 eq_opr);
-		fmgr_info(eq_function, &(*eqfunctions)[i]);
-		fmgr_info(hash_function, &(*hashfunctions)[i]);
+		/* We're not supporting cross-type cases here */
+		Assert(left_hash_function == right_hash_function);
+		fmgr_info(eq_function, &(*eqFunctions)[i]);
+		fmgr_info(right_hash_function, &(*hashFunctions)[i]);
 	}
 }
 
@@ -290,13 +286,15 @@ BuildTupleHashTable(int numCols, AttrNumber *keyColIdx,
 
 	hashtable->numCols = numCols;
 	hashtable->keyColIdx = keyColIdx;
-	hashtable->eqfunctions = eqfunctions;
-	hashtable->hashfunctions = hashfunctions;
+	hashtable->tab_hash_funcs = hashfunctions;
+	hashtable->tab_eq_funcs = eqfunctions;
 	hashtable->tablecxt = tablecxt;
 	hashtable->tempcxt = tempcxt;
 	hashtable->entrysize = entrysize;
 	hashtable->tableslot = NULL;	/* will be made on first lookup */
 	hashtable->inputslot = NULL;
+	hashtable->in_hash_funcs = NULL;
+	hashtable->cur_eq_funcs = NULL;
 
 	MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(TupleHashEntryData);
@@ -359,6 +357,8 @@ LookupTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 	 * invoke this code re-entrantly.
 	 */
 	hashtable->inputslot = slot;
+	hashtable->in_hash_funcs = hashtable->tab_hash_funcs;
+	hashtable->cur_eq_funcs = hashtable->tab_eq_funcs;
 
 	saveCurHT = CurTupleHashTable;
 	CurTupleHashTable = hashtable;
@@ -404,6 +404,55 @@ LookupTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
 }
 
 /*
+ * Search for a hashtable entry matching the given tuple.  No entry is
+ * created if there's not a match.  This is similar to the non-creating
+ * case of LookupTupleHashEntry, except that it supports cross-type
+ * comparisons, in which the given tuple is not of the same type as the
+ * table entries.  The caller must provide the hash functions to use for
+ * the input tuple, as well as the equality functions, since these may be
+ * different from the table's internal functions.
+ */
+TupleHashEntry
+FindTupleHashEntry(TupleHashTable hashtable, TupleTableSlot *slot,
+				   FmgrInfo *eqfunctions,
+				   FmgrInfo *hashfunctions)
+{
+	TupleHashEntry entry;
+	MemoryContext oldContext;
+	TupleHashTable saveCurHT;
+	TupleHashEntryData dummy;
+
+	/* Need to run the hash functions in short-lived context */
+	oldContext = MemoryContextSwitchTo(hashtable->tempcxt);
+
+	/*
+	 * Set up data needed by hash and match functions
+	 *
+	 * We save and restore CurTupleHashTable just in case someone manages to
+	 * invoke this code re-entrantly.
+	 */
+	hashtable->inputslot = slot;
+	hashtable->in_hash_funcs = hashfunctions;
+	hashtable->cur_eq_funcs = eqfunctions;
+
+	saveCurHT = CurTupleHashTable;
+	CurTupleHashTable = hashtable;
+
+	/* Search the hash table */
+	dummy.firstTuple = NULL;	/* flag to reference inputslot */
+	entry = (TupleHashEntry) hash_search(hashtable->hashtab,
+										 &dummy,
+										 HASH_FIND,
+										 NULL);
+
+	CurTupleHashTable = saveCurHT;
+
+	MemoryContextSwitchTo(oldContext);
+
+	return entry;
+}
+
+/*
  * Compute the hash value for a tuple
  *
  * The passed-in key is a pointer to TupleHashEntryData.  In an actual hash
@@ -427,6 +476,7 @@ TupleHashTableHash(const void *key, Size keysize)
 	TupleHashTable hashtable = CurTupleHashTable;
 	int			numCols = hashtable->numCols;
 	AttrNumber *keyColIdx = hashtable->keyColIdx;
+	FmgrInfo   *hashfunctions;
 	uint32		hashkey = 0;
 	int			i;
 
@@ -434,13 +484,15 @@ TupleHashTableHash(const void *key, Size keysize)
 	{
 		/* Process the current input tuple for the table */
 		slot = hashtable->inputslot;
+		hashfunctions = hashtable->in_hash_funcs;
 	}
 	else
 	{
 		/* Process a tuple already stored in the table */
 		/* (this case never actually occurs in current dynahash.c code) */
 		slot = hashtable->tableslot;
-		ExecStoreMemTuple(tuple, slot, false);
+		ExecStoreMinimalTuple(tuple, slot, false);
+		hashfunctions = hashtable->tab_hash_funcs;
 	}
 
 	for (i = 0; i < numCols; i++)
@@ -458,7 +510,7 @@ TupleHashTableHash(const void *key, Size keysize)
 		{
 			uint32		hkey;
 
-			hkey = DatumGetUInt32(FunctionCall1(&hashtable->hashfunctions[i],
+			hkey = DatumGetUInt32(FunctionCall1(&hashfunctions[i],
 												attr));
 			hashkey ^= hkey;
 		}
@@ -498,15 +550,16 @@ TupleHashTableMatch(const void *key1, const void *key2, Size keysize)
 	 */
 	Assert(tuple1 != NULL);
 	slot1 = hashtable->tableslot;
-	ExecStoreMemTuple(tuple1, slot1, false);
+	ExecStoreMinimalTuple(tuple1, slot1, false);
 	Assert(tuple2 == NULL);
 	slot2 = hashtable->inputslot;
 
-	if (execTuplesMatch(slot1,
-						slot2,
+	/* For crosstype comparisons, the inputslot must be first */
+	if (execTuplesMatch(slot2,
+						slot1,
 						hashtable->numCols,
 						hashtable->keyColIdx,
-						hashtable->eqfunctions,
+						hashtable->cur_eq_funcs,
 						hashtable->tempcxt))
 		return 0;
 	else

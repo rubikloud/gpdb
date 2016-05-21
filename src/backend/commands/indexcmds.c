@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/indexcmds.c,v 1.151 2007/01/05 22:19:26 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/indexcmds.c,v 1.155 2007/02/01 19:10:26 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -59,7 +59,7 @@
 #include "utils/syscache.h"
 #include "utils/faultinjector.h"
 
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbsrlz.h"
 #include "cdb/cdbvars.h"
@@ -69,10 +69,13 @@
 
 /* non-export function prototypes */
 static void CheckPredicate(Expr *predicate);
-static void ComputeIndexAttrs(IndexInfo *indexInfo, Oid *classOidP,
+static void ComputeIndexAttrs(IndexInfo *indexInfo,
+				  Oid *classOidP,
+				  int16 *colOptionP,
 				  List *attList,
 				  Oid relId,
 				  char *accessMethodName, Oid accessMethodId,
+				  bool amcanorder,
 				  bool isconstraint);
 static Oid GetIndexOpClass(List *opclass, Oid attrType,
 				char *accessMethodName, Oid accessMethodId);
@@ -144,8 +147,10 @@ DefineIndex(RangeVar *heapRelation,
 	Relation	rel;
 	HeapTuple	tuple;
 	Form_pg_am	accessMethodForm;
+	bool		amcanorder;
 	RegProcedure amoptions;
 	Datum		reloptions;
+	int16	   *coloptions;
 	IndexInfo  *indexInfo;
 	int			numberOfAttributes;
 	List	   *old_xact_list;
@@ -372,6 +377,7 @@ DefineIndex(RangeVar *heapRelation,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("append-only tables do not support unique indexes")));
 
+	amcanorder = accessMethodForm->amcanorder;
 	amoptions = accessMethodForm->amoptions;
 
 	caql_endscan(amcqCtx);
@@ -385,7 +391,7 @@ DefineIndex(RangeVar *heapRelation,
 		if (list_length(rangetable) != 1 || getrelid(1, rangetable) != relationId)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-					 errmsg("index expressions and predicates may refer only to the table being indexed")));
+					 errmsg("index expressions and predicates can refer only to the table being indexed")));
 	}
 
 	/*
@@ -504,9 +510,10 @@ DefineIndex(RangeVar *heapRelation,
 	indexInfo->opaque = (void*)palloc0(sizeof(IndexInfoOpaque));
 
 	classObjectId = (Oid *) palloc(numberOfAttributes * sizeof(Oid));
-	ComputeIndexAttrs(indexInfo, classObjectId, attributeList,
+	coloptions = (int16 *) palloc(numberOfAttributes * sizeof(int16));
+	ComputeIndexAttrs(indexInfo, classObjectId, coloptions, attributeList,
 					  relationId, accessMethodName, accessMethodId,
-					  isconstraint);
+					  amcanorder, isconstraint);
 
 	if (shouldDispatch)
 	{
@@ -655,7 +662,8 @@ DefineIndex(RangeVar *heapRelation,
 		indexRelationId =
 			index_create(relationId, indexRelationName, indexRelationId,
 						 indexInfo, accessMethodId, tablespaceId, classObjectId,
-						 reloptions, primary, isconstraint, &(stmt->constrOid),
+						 coloptions, reloptions, primary, isconstraint,
+						 &(stmt->constrOid),
 						 allowSystemTableModsDDL, skip_build, concurrent, altconname);
 
         /*
@@ -712,7 +720,7 @@ DefineIndex(RangeVar *heapRelation,
 		indexRelationId =
 			index_create(relationId, indexRelationName, indexRelationId,
 						 indexInfo, accessMethodId, tablespaceId, classObjectId,
-						 reloptions, primary, isconstraint, &(stmt->constrOid),
+						 coloptions, reloptions, primary, isconstraint, &(stmt->constrOid),
 						 allowSystemTableModsDDL, skip_build, concurrent, altconname);
 	}
 
@@ -867,13 +875,19 @@ CheckPredicate(Expr *predicate)
 		   errmsg("functions in index predicate must be marked IMMUTABLE")));
 }
 
+/*
+ * Compute per-index-column information, including indexed column numbers
+ * or index expressions, opclasses, and indoptions.
+ */
 static void
 ComputeIndexAttrs(IndexInfo *indexInfo,
 				  Oid *classOidP,
+				  int16 *colOptionP,
 				  List *attList,	/* list of IndexElem's */
 				  Oid relId,
 				  char *accessMethodName,
 				  Oid accessMethodId,
+				  bool amcanorder,
 				  bool isconstraint)
 {
 	ListCell   *rest;
@@ -887,6 +901,9 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 		IndexElem  *attribute = (IndexElem *) lfirst(rest);
 		Oid			atttype;
 
+		/*
+		 * Process the column-or-expression to be indexed.
+		 */
 		if (attribute->name != NULL)
 		{
 			/* Simple index attribute */
@@ -966,10 +983,49 @@ ComputeIndexAttrs(IndexInfo *indexInfo,
 						 errmsg("functions in index expression must be marked IMMUTABLE")));
 		}
 
+		/*
+		 * Identify the opclass to use.
+		 */
 		classOidP[attn] = GetIndexOpClass(attribute->opclass,
 										  atttype,
 										  accessMethodName,
 										  accessMethodId);
+
+		/*
+		 * Set up the per-column options (indoption field).  For now, this
+		 * is zero for any un-ordered index, while ordered indexes have DESC
+		 * and NULLS FIRST/LAST options.
+		 */
+		colOptionP[attn] = 0;
+		if (amcanorder)
+		{
+			/* default ordering is ASC */
+			if (attribute->ordering == SORTBY_DESC)
+				colOptionP[attn] |= INDOPTION_DESC;
+			/* default null ordering is LAST for ASC, FIRST for DESC */
+			if (attribute->nulls_ordering == SORTBY_NULLS_DEFAULT)
+			{
+				if (attribute->ordering == SORTBY_DESC)
+					colOptionP[attn] |= INDOPTION_NULLS_FIRST;
+			}
+			else if (attribute->nulls_ordering == SORTBY_NULLS_FIRST)
+				colOptionP[attn] |= INDOPTION_NULLS_FIRST;
+		}
+		else
+		{
+			/* index AM does not support ordering */
+			if (attribute->ordering != SORTBY_DEFAULT)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("access method \"%s\" does not support ASC/DESC options",
+								accessMethodName)));
+			if (attribute->nulls_ordering != SORTBY_NULLS_DEFAULT)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("access method \"%s\" does not support NULLS FIRST/LAST options",
+								accessMethodName)));
+		}
+
 		attn++;
 	}
 }
@@ -1350,6 +1406,7 @@ relationHasPrimaryKey(Relation rel)
 	List	   *indexoidlist;
 	ListCell   *indexoidscan;
 	cqContext  *pcqCtx;
+
 	/*
 	 * Get the list of index OIDs for the table from the relcache, and look up
 	 * each one in the pg_index syscache until we find one marked primary key
@@ -1582,19 +1639,24 @@ ReindexIndex(ReindexStmt *stmt)
 }
 
 /*
- * Perform REINDEX on each relation of the relids list.  The caller should
- * close the transaction before calling this since it opens and closes a
- * transaction per relation.  This is designed for QD/utility, and is not
- * useful for QE.
+ * Perform REINDEX on each relation of the relids list.  The function
+ * opens and closes a transaction per relation.  This is designed for
+ * QD/utility, and is not useful for QE.
  */
 static void
 ReindexRelationList(List *relids)
 {
 	ListCell   *lc;
 
-	/* The caller should have closed transaction (see function comments). */
-	Assert(!IsTransactionOrTransactionBlock());
 	Assert(Gp_role != GP_ROLE_EXECUTE);
+
+	/*
+	 * Commit ongoing transaction so that we can start a new
+	 * transaction per relation.
+	 */
+	CommitTransactionCommand();
+
+	SIMPLE_FAULT_INJECTOR(ReindexDB);
 
 	foreach (lc, relids)
 	{
@@ -1640,6 +1702,13 @@ ReindexRelationList(List *relids)
 
 		CommitTransactionCommand();
 	}
+
+	/*
+	 * We committed the transaction above, so start a new one before
+	 * returning.
+	 */
+	setupRegularDtxContext();
+	StartTransactionCommand();
 }
 
 /*
@@ -1674,7 +1743,7 @@ ReindexTable(ReindexStmt *stmt)
 		PartitionNode *pn;
 
 		pn = get_parts(relid, 0 /* level */, 0 /* parent */, false /* inctemplate */,
-			CurrentMemoryContext, true /* includesubparts */);
+					   true /* includesubparts */);
 		prels = all_partition_relids(pn);
 	}
 	else if (rel_is_child_partition(relid))
@@ -1740,13 +1809,8 @@ ReindexTable(ReindexStmt *stmt)
 		caql_endscan(pcqCtx);
 	}
 
-	/* Now reindex each rel in a separate transaction */
-	CommitTransactionCommand();
-
 	ReindexRelationList(relids);
 
-	setupRegularDtxContext();
-	StartTransactionCommand();
 	MemoryContextDelete(private_context);
 }
 
@@ -1862,14 +1926,7 @@ ReindexDatabase(ReindexStmt *stmt)
 	}
 	caql_endscan(pcqCtx);
 
-	/* Now reindex each rel in a separate transaction */
-	CommitTransactionCommand();
-
-	SIMPLE_FAULT_INJECTOR(ReindexDB);
-
 	ReindexRelationList(relids);
 
-	setupRegularDtxContext();
-	StartTransactionCommand();
 	MemoryContextDelete(private_context);
 }

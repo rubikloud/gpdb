@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/catalog/aclchk.c,v 1.133.2.1 2007/04/20 02:37:48 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/catalog/aclchk.c,v 1.137 2007/02/14 01:58:56 tgl Exp $
  *
  * NOTES
  *	  See acl.h.
@@ -35,6 +35,7 @@
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_opclass.h"
 #include "catalog/pg_operator.h"
+#include "catalog/pg_opfamily.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_filespace.h"
@@ -52,7 +53,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 
 
 static void ExecGrant_Relation(InternalGrant *grantStmt);
@@ -665,28 +666,28 @@ ExecGrant_Relation(InternalGrant *istmt)
 
 	foreach(cell, istmt->objects)
 	{
-		Oid				 relOid		 = lfirst_oid(cell);
-		Datum			 aclDatum;
-		Form_pg_class	 pg_class_tuple;
-		bool			 isNull;
-		AclMode			 avail_goptions;
-		AclMode			 this_privileges;
-		Acl				*old_acl;
-		Acl				*new_acl;
-		Oid				 grantorId;
-		Oid				 ownerId	 = InvalidOid;
-		HeapTuple		 tuple;
-		HeapTuple		 newtuple;
-		Datum			 values[Natts_pg_class];
-		bool			 nulls[Natts_pg_class];
-		bool			 replaces[Natts_pg_class];
-		int				 nnewmembers;
-		Oid				*newmembers;
-		int				 noldmembers = 0;
-		Oid				*oldmembers;
-		bool			 bTemp;
-		cqContext		 cqc;
-		cqContext		*pcqCtx;
+		Oid			relOid = lfirst_oid(cell);
+		Datum		aclDatum;
+		Form_pg_class pg_class_tuple;
+		bool		isNull;
+		AclMode		avail_goptions;
+		AclMode		this_privileges;
+		Acl			*old_acl;
+		Acl			*new_acl;
+		Oid			grantorId;
+		Oid			ownerId	 = InvalidOid;
+		HeapTuple	tuple;
+		HeapTuple	newtuple;
+		Datum		values[Natts_pg_class];
+		bool		nulls[Natts_pg_class];
+		bool		replaces[Natts_pg_class];
+		int			nnewmembers;
+		Oid		   *newmembers;
+		int			noldmembers = 0;
+		Oid		   *oldmembers;
+		bool		bTemp;
+		cqContext	cqc;
+		cqContext  *pcqCtx;
 
 		bTemp = false;
 
@@ -696,12 +697,9 @@ ExecGrant_Relation(InternalGrant *istmt)
 					" WHERE oid = :1 "
 					" FOR UPDATE ",
 					ObjectIdGetDatum(relOid)));
-
 		tuple = caql_getnext(pcqCtx);
-
 		if (!HeapTupleIsValid(tuple))
 			elog(ERROR, "cache lookup failed for relation %u", relOid);
-
 		pg_class_tuple = (Form_pg_class) GETSTRUCT(tuple);
 
 		/* Not sensible to grant on an index */
@@ -807,7 +805,7 @@ ExecGrant_Relation(InternalGrant *istmt)
 				else
 				{
 					if (this_privileges & ~((AclMode) ACL_ALL_RIGHTS_RELATION))
-	
+					{
 						/*
 						 * USAGE is the only permission supported by
 						 * sequences but not by non-sequences.  Don't
@@ -817,6 +815,7 @@ ExecGrant_Relation(InternalGrant *istmt)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_GRANT_OPERATION),
 							  errmsg("invalid privilege type USAGE for table")));
+					}
 				}
 			}
 	
@@ -868,19 +867,19 @@ ExecGrant_Relation(InternalGrant *istmt)
 
 		nnewmembers = aclmembers(new_acl, &newmembers);
 
-			/* finished building new ACL value, now insert it */
-			MemSet(values, 0, sizeof(values));
-			MemSet(nulls, false, sizeof(nulls));
-			MemSet(replaces, false, sizeof(replaces));
+		/* finished building new ACL value, now insert it */
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+		MemSet(replaces, false, sizeof(replaces));
 
-			replaces[Anum_pg_class_relacl - 1] = true;
-			values[Anum_pg_class_relacl - 1] = PointerGetDatum(new_acl);
+		replaces[Anum_pg_class_relacl - 1] = true;
+		values[Anum_pg_class_relacl - 1] = PointerGetDatum(new_acl);
 
-			newtuple = caql_modify_current(pcqCtx, values, nulls, replaces);
+		newtuple = caql_modify_current(pcqCtx, values, nulls, replaces);
 
 		caql_update_current(pcqCtx, newtuple);
 		/* and Update indexes (implicit) */
-		
+
 		/* MPP-7572: Don't track metadata if table in any
 		 * temporary namespace
 		 */
@@ -1227,7 +1226,7 @@ ExecGrant_Language(InternalGrant *istmt)
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 					 errmsg("language \"%s\" is not trusted",
 							NameStr(pg_language_tuple->lanname)),
-				   errhint("Only superusers may use untrusted languages.")));
+				   errhint("Only superusers can use untrusted languages.")));
 
 		/*
 		 * Get owner ID and working copy of existing ACL. If there's no ACL,
@@ -1831,6 +1830,8 @@ static const char *const no_priv_msg[MAX_ACL_KIND] =
 	gettext_noop("permission denied for schema %s"),
 	/* ACL_KIND_OPCLASS */
 	gettext_noop("permission denied for operator class %s"),
+	/* ACL_KIND_OPFAMILY */
+	gettext_noop("permission denied for operator family %s"),
 	/* ACL_KIND_CONVERSION */
 	gettext_noop("permission denied for conversion %s"),
 	/* ACL_KIND_TABLESPACE */
@@ -1861,6 +1862,8 @@ static const char *const not_owner_msg[MAX_ACL_KIND] =
 	gettext_noop("must be owner of schema %s"),
 	/* ACL_KIND_OPCLASS */
 	gettext_noop("must be owner of operator class %s"),
+	/* ACL_KIND_OPFAMILY */
+	gettext_noop("must be owner of operator family %s"),
 	/* ACL_KIND_CONVERSION */
 	gettext_noop("must be owner of conversion %s"),
 	/* ACL_KIND_TABLESPACE */
@@ -2864,6 +2867,35 @@ pg_opclass_ownercheck(Oid opc_oid, Oid roleid)
 }
 
 /*
+ * Ownership check for an operator family (specified by OID).
+ */
+bool
+pg_opfamily_ownercheck(Oid opf_oid, Oid roleid)
+{
+	HeapTuple	tuple;
+	Oid			ownerId;
+
+	/* Superusers bypass all permission checking. */
+	if (superuser_arg(roleid))
+		return true;
+
+	tuple = SearchSysCache(OPFAMILYOID,
+						   ObjectIdGetDatum(opf_oid),
+						   0, 0, 0);
+	if (!HeapTupleIsValid(tuple))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("operator family with OID %u does not exist",
+						opf_oid)));
+
+	ownerId = ((Form_pg_opfamily) GETSTRUCT(tuple))->opfowner;
+
+	ReleaseSysCache(tuple);
+
+	return has_privs_of_role(roleid, ownerId);
+}
+
+/*
  * Ownership check for a database (specified by OID).
  */
 bool
@@ -2897,24 +2929,24 @@ pg_database_ownercheck(Oid db_oid, Oid roleid)
 bool
 pg_conversion_ownercheck(Oid conv_oid, Oid roleid)
 {
+	HeapTuple	tuple;
 	Oid			ownerId;
-	int			fetchCount = 0;
 
 	/* Superusers bypass all permission checking. */
 	if (superuser_arg(roleid))
 		return true;
 
-	ownerId = caql_getoid_plus(
-			NULL,
-			&fetchCount,
-			NULL,
-			cql("SELECT conowner FROM pg_conversion WHERE oid = :1 ",
-				ObjectIdGetDatum(conv_oid)));
-
-	if (0 == fetchCount)
+	tuple = SearchSysCache(CONVOID,
+						   ObjectIdGetDatum(conv_oid),
+						   0, 0, 0);
+	if (!HeapTupleIsValid(tuple))
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("conversion with OID %u does not exist", conv_oid)));
+
+	ownerId = ((Form_pg_conversion) GETSTRUCT(tuple))->conowner;
+
+	ReleaseSysCache(tuple);
 
 	return has_privs_of_role(roleid, ownerId);
 }

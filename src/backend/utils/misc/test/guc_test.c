@@ -232,8 +232,6 @@ test__set_config_option(void **state)
 	bool ret;
 	ret = set_config_option("password_encryption", "off", PGC_POSTMASTER, PGC_S_SESSION, false, false);
 	assert_true(ret);
-	ret = set_config_option("gp_disable_catalog_access_on_segment", "on", PGC_POSTMASTER, PGC_S_SESSION, false, false);
-	assert_true(ret);
 }
 
 /*
@@ -326,6 +324,8 @@ main(int argc, char* argv[])
 		unit_test(test__set_config_option),
 		unit_test(test__find_option)
 	};
+
+	MemoryContextInit();
 
 	return run_tests(tests);
 }

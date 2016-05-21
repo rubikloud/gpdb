@@ -231,6 +231,7 @@ typedef struct MppGroupContext
 	List *sub_tlist; /* Derived (in cdb_grouping_planner) input targetlist. */
 	int numGroupCols;
 	AttrNumber *groupColIdx;
+	Oid		   *groupOperators;
 	int numDistinctCols;
 	AttrNumber *distinctColIdx;
 	DqaInfo *dqaArgs;
@@ -323,11 +324,11 @@ static int compareDqas(const void *larg, const void *rarg);
 static void planDqaJoinOrder(PlannerInfo *root, MppGroupContext *ctx, 
 						   double input_rows);
 static List *make_subplan_tlist(List *tlist, Node *havingQual, 
-								List *grp_clauses, int *pnum_gkeys, AttrNumber **pcols_gkeys,
+								List *grp_clauses, int *pnum_gkeys, AttrNumber **pcols_gkeys, Oid **pcols_gops,
 								List *dqa_args, int *pnum_dqas, AttrNumber **pcols_dqas);
 static List *describe_subplan_tlist(List *sub_tlist,
 						List *tlist, Node *havingQual,
-						List *grp_clauses, int *pnum_gkeys, AttrNumber **pcols_gkeys,
+						List *grp_clauses, int *pnum_gkeys, AttrNumber **pcols_gkeys, Oid **pcols_gops,
 						List *dqa_args, int *pnum_dqas, AttrNumber **pcols_dqas);
 static void generate_multi_stage_tlists(MppGroupContext* ctx,
 						List **p_prelim_tlist,
@@ -488,8 +489,15 @@ cdb_grouping_planner(PlannerInfo* root,
 	AggPlanInfo plan_2p;
 	AggPlanInfo plan_3p;
 	AggPlanInfo *plan_info = NULL;
-	
-	Assert( !has_groups || root->group_pathkeys != NULL );
+
+	/*
+	 * We used to assert here that if has_groups is true, root->group_pathkeys
+	 * != NIL. That is not a safe assumption anymore: For constants like
+	 * "SELECT DISTINCT 1 FROM foo", the planner will correctly deduce that
+	 * the constant "1" is the same for every row, and group_pathkeys will be
+	 * NIL. But we still need to group, to remove duplicate "dummy" rows
+	 * coming from all the segments.
+	 */
 
 	memset(&ctx, 0, sizeof(ctx));
 
@@ -515,7 +523,7 @@ cdb_grouping_planner(PlannerInfo* root,
 		 */
 		if ( has_groups && 
 			 pathkeys_contained_in(root->group_pathkeys, group_context->best_path->pathkeys) &&
-			 cdbpathlocus_collocates(group_context->best_path->locus, root->group_pathkeys, false /*exact_match*/) )
+			 cdbpathlocus_collocates(root, group_context->best_path->locus, root->group_pathkeys, false /*exact_match*/) )
 		{
 			input_path = group_context->best_path;
 		}
@@ -539,7 +547,7 @@ cdb_grouping_planner(PlannerInfo* root,
 	else if ( has_groups ) /* and not single or replicated */
 	{
 		if (root->group_pathkeys != NULL &&
-				cdbpathlocus_collocates(plan_1p.input_locus, root->group_pathkeys, false /*exact_match*/) )
+			cdbpathlocus_collocates(root, plan_1p.input_locus, root->group_pathkeys, false /*exact_match*/) )
 		{
 			plan_1p.group_prep = MPP_GRP_PREP_NONE;
 			plan_1p.output_locus = plan_1p.input_locus; /* may be less discriminating that group locus */
@@ -547,7 +555,17 @@ cdb_grouping_planner(PlannerInfo* root,
 		}
 		else
 		{
-			if (gp_hash_safe_grouping(root))
+			if (root->group_pathkeys == NIL)
+			{
+				/*
+				 * Grouping, but no grouping key. This arises in cases like
+				 * SELECT DISTINCT <constant>, where we need to eliminate duplicates,
+				 * but there is no key to hash on.
+				 */
+				plan_1p.group_prep = MPP_GRP_PREP_HASH_GROUPS;
+				CdbPathLocus_MakeGeneral(&plan_1p.output_locus);
+			}
+			else if (gp_hash_safe_grouping(root))
 			{
 				plan_1p.group_prep = MPP_GRP_PREP_HASH_GROUPS;
 				CdbPathLocus_MakeHashed(&plan_1p.output_locus, root->group_pathkeys);
@@ -608,6 +626,7 @@ cdb_grouping_planner(PlannerInfo* root,
 										   root->parse->groupClause,
 										   &(group_context->numGroupCols),
 										   &(group_context->groupColIdx),
+										   &(group_context->groupOperators),
 										   agg_counts->dqaArgs,
 										   &(group_context->numDistinctCols),
 										   &(group_context->distinctColIdx));
@@ -619,6 +638,7 @@ cdb_grouping_planner(PlannerInfo* root,
 									   root->parse->groupClause,
 									   &(group_context->numGroupCols),
 									   &(group_context->groupColIdx),
+									   &(group_context->groupOperators),
 									   agg_counts->dqaArgs, 
 									   &(group_context->numDistinctCols),
 									   &(group_context->distinctColIdx));
@@ -721,7 +741,10 @@ cdb_grouping_planner(PlannerInfo* root,
 		if ( has_groups )
 		{
 			plan_2p.group_type = MPP_GRP_TYPE_GROUPED_2STAGE;
-			CdbPathLocus_MakeHashed(&plan_2p.output_locus, root->group_pathkeys);
+			if (root->group_pathkeys == NIL)
+				CdbPathLocus_MakeGeneral(&plan_2p.output_locus);
+			else
+				CdbPathLocus_MakeHashed(&plan_2p.output_locus, root->group_pathkeys);
 		}
 		else
 		{
@@ -731,22 +754,24 @@ cdb_grouping_planner(PlannerInfo* root,
 
 		if ( consider_agg & AGG_2PHASE_DQA )
 		{
-			List *distinct_pathkeys;
-				
+			PathKey    *distinct_pathkey;
+			List	   *l;
+
 			/* Either have DQA or not! */
 			Assert(! (consider_agg & AGG_2PHASE) );
 			
 			Insist( IsA(agg_counts->dqaArgs, List) &&
 					list_length((List*)agg_counts->dqaArgs) == 1 );
-			distinct_pathkeys = cdb_make_pathkey_for_expr(root,
-														  linitial(agg_counts->dqaArgs),
-														  list_make1(makeString("=")));
-			distinct_pathkeys = list_make1(distinct_pathkeys);
+			distinct_pathkey = cdb_make_pathkey_for_expr(root,
+														 linitial(agg_counts->dqaArgs),
+														 list_make1(makeString("=")),
+														 true);
+			l = list_make1(distinct_pathkey);
 			
-			if ( ! cdbpathlocus_collocates(plan_2p.input_locus, distinct_pathkeys, false /*exact_match*/))
+			if (!cdbpathlocus_collocates(root, plan_2p.input_locus, l, false /*exact_match*/))
 			{
 				plan_2p.group_prep = MPP_GRP_PREP_HASH_DISTINCT;
-				CdbPathLocus_MakeHashed(&plan_2p.input_locus, distinct_pathkeys);
+				CdbPathLocus_MakeHashed(&plan_2p.input_locus, l);
 			}
 			else
 			{
@@ -754,6 +779,8 @@ cdb_grouping_planner(PlannerInfo* root,
 				plan_2p.output_locus = plan_2p.input_locus;
 				plan_2p.distinctkey_collocate = true;
 			}
+
+			list_free(l);
 		}
 	}
 	
@@ -765,7 +792,10 @@ cdb_grouping_planner(PlannerInfo* root,
 		if ( has_groups )
 		{
 			plan_3p.group_type = MPP_GRP_TYPE_GROUPED_DQA_2STAGE;
-			CdbPathLocus_MakeHashed(&plan_3p.output_locus, root->group_pathkeys);
+			if (root->group_pathkeys == NIL)
+				CdbPathLocus_MakeGeneral(&plan_3p.output_locus);
+			else
+				CdbPathLocus_MakeHashed(&plan_3p.output_locus, root->group_pathkeys);
 		}
 		else
 		{
@@ -784,6 +814,7 @@ cdb_grouping_planner(PlannerInfo* root,
 	ctx.sub_tlist = sub_tlist;
 	ctx.numGroupCols = group_context->numGroupCols;
 	ctx.groupColIdx = group_context->groupColIdx;
+	ctx.groupOperators = group_context->groupOperators;
 	ctx.numDistinctCols = group_context->numDistinctCols;
 	ctx.distinctColIdx = group_context->distinctColIdx;
 	ctx.use_hashed_grouping = group_context->use_hashed_grouping;
@@ -823,24 +854,26 @@ cdb_grouping_planner(PlannerInfo* root,
 		 */
 		for ( i = 0; i < ctx.numDistinctCols; i++ )
 		{
-			List *distinct_pathkeys;
-			
+			PathKey    *distinct_pathkey;
+			List	   *l;
+
 			set_coplan_strategies(root, &ctx, &ctx.dqaArgs[i], plan_3p.input_path);
 
 			/* Determine if the input plan already collocates on the distinct
 			 * key.
 			 */
-			distinct_pathkeys = cdb_make_pathkey_for_expr(root,
-														  ctx.dqaArgs[i].distinctExpr,
-														  list_make1(makeString("=")));
-			distinct_pathkeys = list_make1(distinct_pathkeys);
-			
-			if (cdbpathlocus_collocates(plan_3p.input_locus, distinct_pathkeys, false /*exact_match*/))
+			distinct_pathkey = cdb_make_pathkey_for_expr(root,
+														 ctx.dqaArgs[i].distinctExpr,
+														 list_make1(makeString("=")),
+														 true);
+			l = list_make1(distinct_pathkey);
+
+			if (cdbpathlocus_collocates(root, plan_3p.input_locus, l, false /*exact_match*/))
 			{
 				ctx.dqaArgs[i].distinctkey_collocate = true;
 			}
 
-			list_free(distinct_pathkeys);
+			list_free(l);
 		}
 	}
 	
@@ -928,6 +961,7 @@ make_one_stage_agg_plan(PlannerInfo *root,
 	List	   *sub_tlist = ctx->sub_tlist;
 	int			numGroupCols = ctx->numGroupCols;
 	AttrNumber *groupColIdx = ctx->groupColIdx;
+	Oid		   *groupOperators = ctx->groupOperators;
 	Path       *best_path = ctx->best_path;
 	Path       *cheapest_path = ctx->cheapest_path;
 	Path       *path = NULL;
@@ -1049,6 +1083,7 @@ make_one_stage_agg_plan(PlannerInfo *root,
 										AGG_HASHED, false,
 										numGroupCols,
 										groupColIdx,
+										groupOperators,
 										numGroups,
 										0, /* num_nullcols */
 										0, /* input_grouping */
@@ -1101,6 +1136,7 @@ make_one_stage_agg_plan(PlannerInfo *root,
 											aggstrategy, false,
 											numGroupCols,
 											groupColIdx,
+											groupOperators,
 											numGroups,
 											0, /* num_nullcols */
 											0, /* input_grouping */
@@ -1120,6 +1156,7 @@ make_one_stage_agg_plan(PlannerInfo *root,
 												  (List *) parse->havingQual,
 												  &numGroupCols,
 												  &groupColIdx,
+												  &groupOperators,
 												  ctx->agg_counts,
 												  ctx->canonical_grpsets,
 												  ctx->p_dNumGroups,
@@ -1178,7 +1215,9 @@ make_two_stage_agg_plan(PlannerInfo *root,
 	int			i;
 	int			numGroupCols;
 	AttrNumber *groupColIdx;
+	Oid		   *groupOperators;
 	AttrNumber *prelimGroupColIdx;
+	Oid		   *prelimGroupOperators;
 	Path       *path = ctx->best_path; /* no use for ctx->cheapest_path */
 	long		numGroups = (*(ctx->p_dNumGroups) < 0) ? 0 :
 	                        (*(ctx->p_dNumGroups) > LONG_MAX) ? LONG_MAX :
@@ -1190,6 +1229,7 @@ make_two_stage_agg_plan(PlannerInfo *root,
 	 */
 	numGroupCols = ctx->numGroupCols;
 	groupColIdx = ctx->groupColIdx;
+	groupOperators = ctx->groupOperators;
 
 	/* Create the base plan which will serve as the outer plan (argument)
 	 * of the partial Agg node.
@@ -1281,11 +1321,16 @@ make_two_stage_agg_plan(PlannerInfo *root,
 	 * attribute numbers: (1, 2, 3, ...).  Later, we'll need
 	 */
 	prelimGroupColIdx = NULL;
+	prelimGroupOperators = NULL;
 	if ( numGroupCols > 0 )
 	{
 		prelimGroupColIdx = (AttrNumber*)palloc(numGroupCols * sizeof(AttrNumber));
+		prelimGroupOperators = (Oid *) palloc(numGroupCols * sizeof(Oid));
 		for ( i = 0; i < numGroupCols; i++ )
+		{
 			prelimGroupColIdx[i] = i+1;
+			prelimGroupOperators[i] = groupOperators[i];
+		}
 	}
 	
 	/*
@@ -1345,6 +1390,7 @@ make_two_stage_agg_plan(PlannerInfo *root,
 										aggstrategy, root->config->gp_hashagg_streambottom,
 										numGroupCols,
 										groupColIdx,
+										groupOperators,
 										numGroups,
 										0, /* num_nullcols */
 										0, /* input_grouping */
@@ -1367,6 +1413,7 @@ make_two_stage_agg_plan(PlannerInfo *root,
 											  NIL, /* no havingQual */
 											  &numGroupCols,
 											  &groupColIdx,
+											  &groupOperators,
 											  ctx->agg_counts,
 											  ctx->canonical_grpsets,
 											  ctx->p_dNumGroups,
@@ -1376,16 +1423,26 @@ make_two_stage_agg_plan(PlannerInfo *root,
 		/* Since we add Grouping as an additional grouping column,
 		 * we need to add it into prelimGroupColIdx. */
 		if (prelimGroupColIdx != NULL)
+		{
 			prelimGroupColIdx = (AttrNumber *)
 				repalloc(prelimGroupColIdx, 
 						 numGroupCols * sizeof(AttrNumber));
+			prelimGroupOperators = (Oid *) repalloc(prelimGroupOperators,
+						 numGroupCols * sizeof(Oid));
+		}
 		else
+		{
 			prelimGroupColIdx = (AttrNumber *)
 				palloc0(numGroupCols * sizeof(AttrNumber));
-		
+			prelimGroupOperators = (Oid *)
+				palloc0(numGroupCols * sizeof(Oid));
+		}
+
 		Assert(numGroupCols >= 2);
 		prelimGroupColIdx[numGroupCols-1] = groupColIdx[numGroupCols-1];
+		prelimGroupOperators[numGroupCols-1] = groupOperators[numGroupCols-1];
 		prelimGroupColIdx[numGroupCols-2] = groupColIdx[numGroupCols-2];
+		prelimGroupOperators[numGroupCols-2] = groupOperators[numGroupCols-2];
 	}
 	
 	/*
@@ -1453,6 +1510,7 @@ make_two_stage_agg_plan(PlannerInfo *root,
 									   aggstrategy,
 									   numGroupCols,
 									   prelimGroupColIdx,
+									   prelimGroupOperators,
 									   0, /* num_nullcols */
 									   0, /* input_grouping */
 									   ctx->grouping,
@@ -1708,6 +1766,9 @@ make_three_stage_agg_plan(PlannerInfo *root, MppGroupContext *ctx)
 		/* Need to adjust root.  Is this enuf?  I think so. */
 		root->parse->rtable = rtable;
 		root->parse->targetList = copyObject(result_plan->targetlist);
+
+		/* We modified the parse tree, signal that to the caller */
+		ctx->querynode_changed = true;
 	}
 	// Rebuild arrays for RelOptInfo and RangeTblEntry for the PlannerInfo
 	// since the underlying range tables have been transformed
@@ -1826,7 +1887,9 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 	List	   *current_pathkeys;
 	AggStrategy aggstrategy;
 	AttrNumber *prelimGroupColIdx;
+	Oid		   *prelimGroupOperators;
 	AttrNumber *inputGroupColIdx;
+	Oid		   *inputGroupOperators;
 	List	   *extendedGroupClause;
 	Query	   *original_parse;
 	bool		groups_sorted = false;
@@ -1834,7 +1897,7 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 	int i, n;
 	DqaInfo *dqaArg = &ctx->dqaArgs[dqa_index];
 	bool sort_coplans = ( ctx->join_strategy == DqaJoinMerge );
-	bool groupkeys_collocate = cdbpathlocus_collocates(ctx->input_locus, root->group_pathkeys, false /*exact_match*/);
+	bool groupkeys_collocate = cdbpathlocus_collocates(root, ctx->input_locus, root->group_pathkeys, false /*exact_match*/);
 	bool need_inter_agg = false;
 	bool dqaduphazard = false;
 	bool stream_bottom_agg = root->config->gp_hashagg_streambottom; /* Take hint */
@@ -1886,28 +1949,50 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 	 {
 		GroupClause* gc;
 		TargetEntry *tle;
-		 
-		prelimGroupColIdx = inputGroupColIdx = NULL;
-		
+		Oid			dqaArg_orderingop;
+		Oid			dqaArg_eqop;
+
+		dqaArg_orderingop = ordering_oper_opid(exprType((Node *) dqaArg->distinctExpr));
+		dqaArg_eqop = get_equality_op_for_ordering_op(dqaArg_orderingop);
+		if (!OidIsValid(dqaArg_eqop))          /* shouldn't happen */
+			elog(ERROR, "could not find equality operator for ordering operator %u",
+				 dqaArg_orderingop);
+
 		n = ctx->numGroupCols + 1; /* add the DQA argument as a grouping key */
 		Assert( n > 0 );
-		
+
 		prelimGroupColIdx = (AttrNumber*)palloc(n * sizeof(AttrNumber));
-		inputGroupColIdx = (AttrNumber*)palloc(n * sizeof(AttrNumber));
-		
-		for ( i = 0; i < n; i++ )
-			prelimGroupColIdx[i] = i+1;
-		for ( i = 0; i < ctx->numGroupCols; i++ )
-			inputGroupColIdx[i] = ctx->groupColIdx[i];
-		inputGroupColIdx[ctx->numGroupCols] = dqaArg->base_index;
+		prelimGroupOperators = (Oid *) palloc(n * sizeof(Oid));
 
 		gc = makeNode(GroupClause);
 		tle = get_tle_by_resno(ctx->sub_tlist,  dqaArg->base_index);
 		gc->tleSortGroupRef = tle->ressortgroupref;
-		gc->sortop = ordering_oper_opid(exprType((Node*)dqaArg->distinctExpr));
-		
+		gc->sortop = dqaArg_orderingop;
+
 		extendedGroupClause = list_copy(root->parse->groupClause);
-		extendedGroupClause = lappend(extendedGroupClause,gc); 
+		extendedGroupClause = lappend(extendedGroupClause, gc);
+
+		for ( i = 0; i < ctx->numGroupCols; i++ )
+		{
+			prelimGroupColIdx[i] = i+1;
+			prelimGroupOperators[i] = ctx->groupOperators[i];
+		}
+		prelimGroupColIdx[i] = i+1;
+		prelimGroupOperators[i] = dqaArg_eqop;
+		if (!OidIsValid(prelimGroupOperators[i]))          /* shouldn't happen */
+			elog(ERROR, "could not find equality operator for ordering operator %u",
+				 prelimGroupOperators[i]);
+
+		inputGroupColIdx = (AttrNumber*)palloc(n * sizeof(AttrNumber));
+		inputGroupOperators = (Oid *) palloc(n * sizeof(Oid));
+
+		for ( i = 0; i < ctx->numGroupCols; i++ )
+		{
+			inputGroupColIdx[i] = ctx->groupColIdx[i];
+			inputGroupOperators[i] = ctx->groupOperators[i];
+		}
+		inputGroupColIdx[ctx->numGroupCols] = dqaArg->base_index;
+		inputGroupOperators[ctx->numGroupCols] = dqaArg_eqop;
 	}
 	
 	/* 
@@ -1964,6 +2049,7 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 								aggstrategy, stream_bottom_agg,
 								ctx->numGroupCols + 1,
 								inputGroupColIdx,
+								inputGroupOperators,
 								numGroups,
 								0, /* num_nullcols */
 								0, /* input_grouping */
@@ -2093,6 +2179,7 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 										   aggstrategy,
 										   ctx->numGroupCols + 1,
 										   prelimGroupColIdx,
+										   prelimGroupOperators,
 										   0, /* num_nullcols */
 										   0, /* input_grouping */
 										   0, /* grouping */
@@ -2167,6 +2254,7 @@ make_plan_for_one_dqa(PlannerInfo *root, MppGroupContext *ctx, int dqa_index,
 									   aggstrategy,
 									   ctx->numGroupCols,
 									   prelimGroupColIdx,
+									   prelimGroupOperators,
 									   0, /* num_nullcols */
 									   0, /* input_grouping */
 									   ctx->grouping,
@@ -2352,10 +2440,21 @@ join_dqa_coplan(PlannerInfo *root, MppGroupContext *ctx, Plan *outer, int dqa_in
 			 * distinct in the join key.  (So does the inner, for that matter,
 			 * but the MJ algorithm is only sensitive to the outer.)
 			 */
-			List	   *mergefamilies;
-			List	   *mergestrategies;
-			build_mergejoin_strat_lists(joinclause, &mergefamilies,
-										&mergestrategies);
+			Oid		   *mergefamilies = palloc(sizeof(Oid) * list_length(joinclause));
+			int		   *mergestrategies = palloc(sizeof(int) * list_length(joinclause));
+			bool	   *mergenullsfirst = palloc(sizeof(bool) * list_length(joinclause));
+			ListCell   *l;
+			int			i = 0;
+
+			foreach (l, joinclause)
+			{
+				RestrictInfo *rinfo = (RestrictInfo *) lfirst(l);
+
+				mergefamilies[i] = linitial_oid(rinfo->mergeopfamilies);
+				mergestrategies[i] = BTLessStrategyNumber;
+				mergenullsfirst[i] = false;
+				i++;
+			}
 
 			joinclause = get_actual_clauses(joinclause);
 			join_plan = (Plan*)make_mergejoin(join_tlist,
@@ -2363,6 +2462,7 @@ join_dqa_coplan(PlannerInfo *root, MppGroupContext *ctx, Plan *outer, int dqa_in
 											  joinclause,
 											  mergefamilies,
 											  mergestrategies,
+											  mergenullsfirst,
 											  outer, inner,
 											  JOIN_INNER);
 			((MergeJoin*)join_plan)->unique_outer = true;
@@ -2421,7 +2521,7 @@ join_dqa_coplan(PlannerInfo *root, MppGroupContext *ctx, Plan *outer, int dqa_in
  */
 List *make_subplan_tlist(List *tlist, Node *havingQual, 
 						 List *grp_clauses, 
-						 int *pnum_gkeys, AttrNumber **pcols_gkeys,
+						 int *pnum_gkeys, AttrNumber **pcols_gkeys, Oid **pcols_gops,
 						 List *dqa_args,
 						 int *pnum_dqas, AttrNumber **pcols_dqas)
 {
@@ -2430,6 +2530,7 @@ List *make_subplan_tlist(List *tlist, Node *havingQual,
 
 	int num_gkeys;
 	AttrNumber *cols_gkeys;
+	Oid		   *cols_gops;
 
 	Assert( dqa_args != NIL? pnum_dqas != NULL && pcols_dqas != NULL: true );
 	
@@ -2442,22 +2543,22 @@ List *make_subplan_tlist(List *tlist, Node *havingQual,
 	if (num_gkeys > 0)
 	{
 		int			keyno = 0;
-		ListCell   *l;
 		List       *tles;
+		List	   *sortops;
+		ListCell   *lc_tle;
+		ListCell   *lc_sortop;
 
 		cols_gkeys = (AttrNumber*) palloc(sizeof(AttrNumber) * num_gkeys);
+		cols_gops = (Oid *) palloc(sizeof(Oid) * num_gkeys);
 
-		tles = get_sortgroupclauses_tles(grp_clauses, tlist);
+		get_sortgroupclauses_tles(grp_clauses, tlist, &tles, &sortops);
 
-		foreach (l, tles)
+		forboth (lc_tle, tles, lc_sortop, sortops)
 		{
-			Node	   *expr;
-			TargetEntry *tle, *sub_tle = NULL;
+			TargetEntry *tle = (TargetEntry*) lfirst(lc_tle);
+			Node	   *expr = (Node*) tle->expr;;
+			TargetEntry *sub_tle = NULL;
 			ListCell   *sl;
-
-			tle = (TargetEntry*) lfirst(l);
-
-			expr = (Node*)tle->expr;
 
 			/* Find or make a matching sub_tlist entry. */
 			foreach(sl, sub_tlist)
@@ -2477,15 +2578,23 @@ List *make_subplan_tlist(List *tlist, Node *havingQual,
 
 			/* Set its group reference and save its resno */
 			sub_tle->ressortgroupref = tle->ressortgroupref;
-			cols_gkeys[keyno++] = sub_tle->resno;
+			cols_gkeys[keyno] = sub_tle->resno;
+
+			cols_gops[keyno] = get_equality_op_for_ordering_op(lfirst_oid(lc_sortop));
+			if (!OidIsValid(cols_gops[keyno]))          /* shouldn't happen */
+				elog(ERROR, "could not find equality operator for ordering operator %u",
+					 cols_gops[keyno]);
+			keyno++;
 		}
 		*pnum_gkeys = num_gkeys;
 		*pcols_gkeys = cols_gkeys;
+		*pcols_gops = cols_gops;
 	}
 	else
 	{
 		*pnum_gkeys = 0;
 		*pcols_gkeys = NULL;
+		*pcols_gops = NULL;
 	}
 	
 	if ( dqa_args != NIL )
@@ -2605,53 +2714,65 @@ List *augment_subplan_tlist(List *tlist, List *exprs, int *pnum, AttrNumber **pc
  * This function is for the case when a subplan target list (not a whole plan)
  * is supplied to cdb_grouping_planner.
  */
-List *describe_subplan_tlist(List *sub_tlist,
-							 List *tlist, Node *havingQual,
-							 List *grp_clauses, int *pnum_gkeys, AttrNumber **pcols_gkeys,
-							 List *dqa_args, int *pnum_dqas, AttrNumber **pcols_dqas)
+List *
+describe_subplan_tlist(List *sub_tlist,
+					   List *tlist, Node *havingQual,
+					   List *grp_clauses, int *pnum_gkeys, AttrNumber **pcols_gkeys, Oid **pcols_gops,
+					   List *dqa_args, int *pnum_dqas, AttrNumber **pcols_dqas)
 {
-	int nkeys;
+	int			nkeys;
 	AttrNumber *cols;
-	
+	Oid		   *grpops;
+
 	nkeys = num_distcols_in_grouplist(grp_clauses);
 	if ( nkeys > 0 )
 	{
-		List *tles;
-		ListCell *lc;
-		int keyno = 0;
-		
-		cols = (AttrNumber*)palloc0(sizeof(AttrNumber)*nkeys);
-									
-									tles = get_sortgroupclauses_tles(grp_clauses, tlist);
-									
-									foreach (lc, tles)
-									{
-										TargetEntry *tle;
-										TargetEntry *sub_tle;
-										
-										tle = (TargetEntry*)lfirst(lc);
-										sub_tle = tlist_member((Node*)tle->expr, sub_tlist);
-										Assert(tle->ressortgroupref != 0);
-										Assert(tle->ressortgroupref == sub_tle->ressortgroupref);
-										Assert(keyno < nkeys);
-										
-										cols[keyno++] = sub_tle->resno;
-									}
-									*pnum_gkeys = nkeys;
-									*pcols_gkeys = cols;
-									}
-									else
-									{
-										*pnum_gkeys = 0;
-										*pcols_gkeys = NULL;
-									}
-									
-									if ( dqa_args != NIL )
-									sub_tlist = augment_subplan_tlist(sub_tlist, dqa_args, pnum_dqas, pcols_dqas, true);
-									
-									return sub_tlist;
-									}
-									
+		List	   *tles;
+		List	   *sortops;
+		ListCell   *lc_tle;
+		ListCell   *lc_sortop;
+		int			keyno = 0;
+
+		cols = (AttrNumber *) palloc0(sizeof(AttrNumber) * nkeys);
+		grpops = (Oid *) palloc0(sizeof(Oid) * nkeys);
+
+		get_sortgroupclauses_tles(grp_clauses, tlist, &tles, &sortops);
+
+		forboth (lc_tle, tles, lc_sortop, sortops)
+		{
+			TargetEntry *tle = (TargetEntry *) lfirst(lc_tle);
+			TargetEntry *sub_tle;
+
+			sub_tle = tlist_member((Node *) tle->expr, sub_tlist);
+			Assert(tle->ressortgroupref != 0);
+			Assert(tle->ressortgroupref == sub_tle->ressortgroupref);
+			Assert(keyno < nkeys);
+
+			cols[keyno] = sub_tle->resno;
+
+			grpops[keyno] = get_equality_op_for_ordering_op(lfirst_oid(lc_sortop));
+			if (!OidIsValid(grpops[keyno]))          /* shouldn't happen */
+				elog(ERROR, "could not find equality operator for ordering operator %u",
+					 grpops[keyno]);
+			keyno++;
+		}
+		Assert(nkeys == keyno);
+		*pnum_gkeys = nkeys;
+		*pcols_gkeys = cols;
+		*pcols_gops = grpops;
+	}
+	else
+	{
+		*pnum_gkeys = 0;
+		*pcols_gkeys = NULL;
+		*pcols_gops = NULL;
+	}
+
+	if ( dqa_args != NIL )
+		sub_tlist = augment_subplan_tlist(sub_tlist, dqa_args, pnum_dqas, pcols_dqas, true);
+
+	return sub_tlist;
+}
 
 /*
  * Generate targetlist for a SubqueryScan node to wrap the stage-one
@@ -2714,47 +2835,54 @@ generate_subquery_tlist(Index varno, List *input_tlist,
  * Function: cdbpathlocus_collocates
  *
  * Is a relation with the given locus guaranteed to collocate tuples with
- * non-distinct values of the key.  The key is a list of pathkeys (each of
- * which is a list of PathKeyItem*).
+ * non-distinct values of the key.  The key is a list of PathKeys.
  *
  * Collocation is guaranteed if the locus specifies a single process or
  * if the result is partitioned on a subset of the keys that must be
  * collocated.
  *
- * We ignore onther sorts of collocation, e.g., replication or partitioning
+ * We ignore other sorts of collocation, e.g., replication or partitioning
  * on a range since these cannot occur at the moment (MPP 2.3).
  */
-bool cdbpathlocus_collocates(CdbPathLocus locus, List *pathkeys, bool exact_match)
+bool
+cdbpathlocus_collocates(PlannerInfo *root, CdbPathLocus locus, List *pathkeys,
+						bool exact_match)
 {
-	ListCell *lc;
-	List *exprs = NIL;
-	
-	if ( CdbPathLocus_IsBottleneck(locus) )
+	ListCell   *i;
+	List	   *pk_eclasses;
+
+	if (CdbPathLocus_IsBottleneck(locus))
 		return true;
-	
-	if ( !CdbPathLocus_IsHashed(locus) )
+
+	if (!CdbPathLocus_IsHashed(locus))
 		return false;  /* Or would HashedOJ ok, too? */
-	
-	if (exact_match && list_length(pathkeys) != list_length(locus.partkey))
-	{
+
+	if (exact_match && list_length(pathkeys) != list_length(locus.partkey_h))
 		return false;
-	}
-	
-	/* Extract a list of expressions from the pathkeys.  Since the locus
-	 * presumably knows all about attribute equivalence classes, we use
-	 * only the first item in each input path key. 
+
+	/*
+	 * Extract a list of eclasses from the pathkeys.
 	 */
-	foreach( lc, pathkeys )
+	pk_eclasses = NIL;
+	foreach(i, pathkeys)
 	{
-		PathKeyItem *item;
-		List *lst = (List*)lfirst(lc);
-		Assert( list_length(lst) > 0 );
-		item = (PathKeyItem*)linitial(lst);
-		exprs = lappend(exprs, item->key);
+		PathKey	   *pathkey = (PathKey *) lfirst(i);
+		EquivalenceClass *ec;
+
+		ec = pathkey->pk_eclass;
+		while (ec->ec_merged != NULL)
+			ec = ec->ec_merged;
+
+		pk_eclasses = lappend(pk_eclasses, ec);
 	}
-	
-	/* Check for containment of locus in exprs. */
-	return cdbpathlocus_is_hashed_on_exprs(locus, exprs);
+
+	/*
+	 * Check for containment of locus in pk_eclasses.
+	 *
+	 * We ignore constants in the locus hash key. A constant has the same
+	 * value everywhere, so it doesn't affect collocation.
+	 */
+	return cdbpathlocus_is_hashed_on_eclasses(locus, pk_eclasses, true);
 }
 
 
@@ -2816,6 +2944,7 @@ void generate_three_tlists(List *tlist,
 						   Node *havingQual,
 						   int numGroupCols,
 						   AttrNumber *groupColIdx,
+						   Oid *groupOperators,
 						   List **p_tlist1,
 						   List **p_tlist2,
 						   List **p_tlist3,
@@ -2839,6 +2968,7 @@ void generate_three_tlists(List *tlist,
 	ctx.havingQual = havingQual;
 	ctx.numGroupCols = numGroupCols;
 	ctx.groupColIdx = groupColIdx;
+	ctx.groupOperators = groupOperators;
 	ctx.numDistinctCols = 0;
 	ctx.distinctColIdx = NULL;
 	
@@ -3818,6 +3948,7 @@ add_second_stage_agg(PlannerInfo *root,
 					 AggStrategy aggstrategy,
 					 int numGroupCols,
 					 AttrNumber *prelimGroupColIdx,
+					 Oid *prelimGroupOperators,
 					 int num_nullcols,
 					 uint64 input_grouping,
 					 uint64 grouping,
@@ -3940,6 +4071,7 @@ add_second_stage_agg(PlannerInfo *root,
 			aggstrategy, false,
 			numGroupCols,
 			prelimGroupColIdx,
+			prelimGroupOperators,
 			lNumGroups,
 			num_nullcols,
 			input_grouping,
@@ -3998,14 +4130,7 @@ Plan* add_subqueryscan(PlannerInfo* root, List **p_pathkeys,
 
 	mark_passthru_locus(subplan, true, true);
 
-	/* Reconstruct equi_key_list since the rtable has changed.
-	 * XXX we leak the old one.
-	 */
-	root->equi_key_list = construct_equivalencekey_list(root->equi_key_list,
-														resno_map,
-														subquery->targetList,
-														subplan_tlist);
-	if ( p_pathkeys != NULL && *p_pathkeys != NULL )
+	if (p_pathkeys != NULL)
 	{
 		*p_pathkeys = reconstruct_pathkeys(root, *p_pathkeys, resno_map,
 										   subquery->targetList, subplan_tlist);
@@ -4060,11 +4185,13 @@ sorting_prefixes_grouping(PlannerInfo *root)
 static bool
 gp_hash_safe_grouping(PlannerInfo *root)
 {
-	List *grouptles;
+	List	   *grouptles;
+	List	   *groupops;
 	ListCell   *glc;
 
-	grouptles = get_sortgroupclauses_tles(root->parse->groupClause,
-										 root->parse->targetList);
+	get_sortgroupclauses_tles(root->parse->groupClause,
+							  root->parse->targetList,
+							  &grouptles, &groupops);
 	foreach(glc, grouptles)
 	{
 		TargetEntry *tle = (TargetEntry *)lfirst(glc);
@@ -4086,43 +4213,43 @@ List *
 reconstruct_pathkeys(PlannerInfo *root, List *pathkeys, int *resno_map,
 					 List *orig_tlist, List *new_tlist)
 {
-	List *new_pathkeys;
-	
-	ListCell *lc;
-	foreach (lc, pathkeys)
+	List	   *new_pathkeys;
+	ListCell   *i,
+			   *j;
+
+	new_pathkeys = NIL;
+	foreach(i, pathkeys)
 	{
-		List *keys = (List *)lfirst(lc);
-		ListCell *key_lc;
-		TargetEntry *new_tle;
-			
-		Assert(IsA(keys, List));
-		foreach(key_lc, keys)
+		PathKey    *pathkey = (PathKey *) lfirst(i);
+
+		foreach(j, pathkey->pk_eclass->ec_members)
 		{
-			PathKeyItem *item = (PathKeyItem *)lfirst(key_lc);
-			int resno = 0;
-			ListCell *tle_lc;
-			Assert(IsA(item, PathKeyItem));
-				
-			foreach(tle_lc, orig_tlist)
+			EquivalenceMember *em = (EquivalenceMember *) lfirst(j);
+			TargetEntry *tle = tlist_member((Node *) em->em_expr, orig_tlist);
+
+			if (tle)
 			{
-				TargetEntry *tle = (TargetEntry *)lfirst(tle_lc);
-				Assert(IsA(tle, TargetEntry));
-				if (equal(tle->expr, item->key))
-				{
-					resno = tle->resno;
-					break;
-				}
-			}
-			if (resno > 0)
-			{
-				new_tle = get_tle_by_resno(new_tlist, resno_map[resno-1]);
-				Assert(new_tle != NULL);
-				item->key = (Node *)new_tle->expr;
+				TargetEntry *new_tle;
+				EquivalenceClass *new_eclass;
+				PathKey	   *new_pathkey;
+
+				new_tle = get_tle_by_resno(new_tlist, resno_map[tle->resno - 1]);
+				if (!new_tle)
+					elog(ERROR, "could not find path key expression in constructed subquery's target list");
+
+				new_eclass = get_eclass_for_sort_expr(root, new_tle->expr,
+													  em->em_datatype,
+													  pathkey->pk_eclass->ec_opfamilies);
+				new_pathkey = makePathKey(new_eclass, pathkey->pk_opfamily, pathkey->pk_strategy,
+										  pathkey->pk_nulls_first);
+
+				new_pathkeys = lappend(new_pathkeys, new_pathkey);
+				break;
 			}
 		}
 	}
 
-	new_pathkeys = canonicalize_pathkeys(root, pathkeys);
+	new_pathkeys = canonicalize_pathkeys(root, new_pathkeys);
 
 	return new_pathkeys;
 }
@@ -5081,7 +5208,7 @@ wrap_plan_index(PlannerInfo *root, Plan *plan, Query *query,
 	 * Update group_pathkeys in order to represent this subquery.
 	 */
 	root->group_pathkeys =
-		make_pathkeys_for_groupclause(root->parse->groupClause, plan->targetlist);
+		make_pathkeys_for_groupclause(root, root->parse->groupClause, plan->targetlist);
 	return plan;
 }
 
@@ -5186,7 +5313,7 @@ make_parallel_or_sequential_agg(PlannerInfo *root, AggClauseCounts *agg_counts,
 				}
 				aggstrategy = AGG_SORTED;
 				current_pathkeys =
-					make_pathkeys_for_groupclause(root->parse->groupClause, result_plan->targetlist);
+					make_pathkeys_for_groupclause(root, root->parse->groupClause, result_plan->targetlist);
 				current_pathkeys = canonicalize_pathkeys(root, current_pathkeys);
 			}
 			else
@@ -5208,6 +5335,7 @@ make_parallel_or_sequential_agg(PlannerInfo *root, AggClauseCounts *agg_counts,
 										false,
 										group_context->numGroupCols,
 										group_context->groupColIdx,
+										group_context->groupOperators,
 										*group_context->p_dNumGroups,
 										0, /* num_nullcols */
 										0, /* input_grouping */
@@ -5388,6 +5516,7 @@ make_deduplicate_plan(PlannerInfo *root,
 	List			   *tlist;
 	int					numGroupCols;
 	AttrNumber		   *groupColIdx;
+	Oid				   *groupOperators;
 	List			   *pathkeys = NIL;
 	bool				querynode_changed = false;
 	AggClauseCounts		agg_counts;
@@ -5417,7 +5546,8 @@ make_deduplicate_plan(PlannerInfo *root,
 		groupClause = lappend(groupClause, sc);
 	}
 
-	groupColIdx = get_grouplist_colidx(groupClause, sub_tlist, &numGroupCols);
+	get_grouplist_colidx(groupClause, sub_tlist, &numGroupCols,
+						 &groupColIdx, &groupOperators);
 
 	/*
 	 * Make target list derived from sub_tlist.  Note that we filter out
@@ -5472,7 +5602,7 @@ make_deduplicate_plan(PlannerInfo *root,
 												 group_context->tuple_fraction,
 												 group_context->cheapest_path,
 												 NULL,
-												 numGroups,
+												 groupOperators, numGroupCols, numGroups,
 												 &agg_counts);
 	use_hashed_grouping = agg_counts.canHashAgg;
 
@@ -5487,6 +5617,7 @@ make_deduplicate_plan(PlannerInfo *root,
 	ctx.grouping = 0;
 	ctx.numGroupCols = numGroupCols;
 	ctx.groupColIdx = groupColIdx;
+	ctx.groupOperators = groupOperators;
 	ctx.numDistinctCols = 0;
 	ctx.distinctColIdx = NULL;
 	ctx.p_dNumGroups = &numGroups;
@@ -5501,7 +5632,7 @@ make_deduplicate_plan(PlannerInfo *root,
 	root->parse->targetList = tlist;
 	root->parse->havingQual = NULL;
 	root->parse->scatterClause = NIL;
-	root->group_pathkeys = make_pathkeys_for_groupclause(groupClause, tlist);
+	root->group_pathkeys = make_pathkeys_for_groupclause(root, groupClause, tlist);
 
 	/*
 	 * Make a multi-phase or simple agg plan.
@@ -5695,8 +5826,7 @@ within_agg_add_outer_sort(PlannerInfo *root,
 		 * Plain aggregate case.  Gather tuples into QD.
 		 */
 		sort_pathkeys =
-			make_pathkeys_for_sortclauses(sortClause, outer_plan->targetlist);
-		sort_pathkeys = canonicalize_pathkeys(root, sort_pathkeys);
+			make_pathkeys_for_sortclauses(root, sortClause, outer_plan->targetlist, true);
 
 		/*
 		 * Check the sort redundancy.
@@ -5736,7 +5866,7 @@ within_agg_add_outer_sort(PlannerInfo *root,
 		 * group_pathkeys should have been fixed to reflect the latest targetlist.
 		 * best_path->locus is wrong here since we put SubqueryScan already.
 		 */
-		if (!cdbpathlocus_collocates(current_locus, root->group_pathkeys, false /*exact_match*/))
+		if (!cdbpathlocus_collocates(root, current_locus, root->group_pathkeys, false /*exact_match*/))
 		{
 			List	   *groupExprs;
 
@@ -5758,8 +5888,7 @@ within_agg_add_outer_sort(PlannerInfo *root,
 		groupSortClauses = list_concat(copyObject(root->parse->groupClause),
 									   sortClause);
 		sort_pathkeys =
-			make_pathkeys_for_sortclauses(groupSortClauses, outer_plan->targetlist);
-		sort_pathkeys = canonicalize_pathkeys(root, sort_pathkeys);
+			make_pathkeys_for_sortclauses(root, groupSortClauses, outer_plan->targetlist, true);
 
 		if (!pathkeys_contained_in(sort_pathkeys, wag_context->current_pathkeys))
 		{
@@ -5830,13 +5959,15 @@ within_agg_construct_inner(PlannerInfo *root,
 	List			   *pathkeys = NIL;
 	AggClauseCounts		agg_counts;
 	AttrNumber		   *grpColIdx;
+	Oid				   *grpOperators;
 	Query			   *original_parse;
 	List			   *original_group_pathkeys;
 	Query			   *parse;
 	const Index			Inner = 2;
 
-	grpColIdx = get_grouplist_colidx(root->parse->groupClause,
-									 inner_plan->targetlist, &numGroupCols);
+	get_grouplist_colidx(root->parse->groupClause,
+						 inner_plan->targetlist, &numGroupCols,
+						 &grpColIdx, &grpOperators);
 	/* build grouping key columns */
 	tlist = NIL;
 	foreach_with_count (l, root->parse->groupClause, idx)
@@ -5892,7 +6023,7 @@ within_agg_construct_inner(PlannerInfo *root,
 												 group_context->tuple_fraction,
 												 &input_path,
 												 &input_path,
-												 numGroups,
+												 grpOperators, numGroupCols, numGroups,
 												 &agg_counts);
 
 	ctx.best_path = &input_path;
@@ -5906,6 +6037,7 @@ within_agg_construct_inner(PlannerInfo *root,
 	ctx.grouping = 0;
 	ctx.numGroupCols = numGroupCols;
 	ctx.groupColIdx = grpColIdx;
+	ctx.groupOperators = grpOperators;
 	ctx.numDistinctCols = 0;
 	ctx.distinctColIdx = NULL;
 	ctx.p_dNumGroups = &numGroups;
@@ -5922,7 +6054,7 @@ within_agg_construct_inner(PlannerInfo *root,
 	root->parse->havingQual = NULL;
 	root->parse->scatterClause = NIL;
 	root->group_pathkeys =
-		make_pathkeys_for_sortclauses(parse->groupClause, tlist);
+		make_pathkeys_for_sortclauses(root, parse->groupClause, tlist, false);
 
 	/*
 	 * Make a multi-phase or simple aggregate plan.
@@ -5975,12 +6107,15 @@ within_agg_join_plans(PlannerInfo *root,
 {
 	Plan		   *result_plan;
 	ListCell	   *l;
-	int				idx;
 	List		   *join_tlist;
 	List		   *join_clause;
+	Oid			   *mergefamilies;
+	int			   *mergestrategies;
+	bool		   *mergenullsfirst;
 	const Index		Outer = 1, Inner = 2;
 	List		   *extravars;
 	Var			   *pc_var, *tc_var;
+	int				ngroups;
 
 	/*
 	 * Up to now, these should've been prepared.
@@ -5988,44 +6123,13 @@ within_agg_join_plans(PlannerInfo *root,
 	Assert(wag_context->pc_pos > 0);
 	Assert(wag_context->tc_pos > 0);
 
+	ngroups = list_length(root->parse->groupClause);
+	if (list_length(wag_context->current_pathkeys) < ngroups)
+		elog(ERROR, "fewer pathkeys than join clauses");
+
 	/*
 	 * Build target list for grouping columns.
-	 */
-	join_clause = NIL;
-	foreach_with_count (l, root->parse->groupClause, idx)
-	{
-		GroupClause	   *gc = (GroupClause*) lfirst(l);
-		TargetEntry	   *tle;
-		Var			   *outer_var,
-					   *inner_var;
-		RestrictInfo   *rinfo;
-
-		/*
-		 * Construct outer group keys.
-		 */
-		tle = get_sortgroupclause_tle(gc, outer_plan->targetlist);
-		Assert(tle && IsA(tle->expr, Var));
-		outer_var = makeVar(Outer, tle->resno,
-							exprType((Node *) tle->expr),
-							exprTypmod((Node *) tle->expr), 0);
-
-		/*
-		 * Construct inner group keys.
-		 */
-		tle = get_tle_by_resno(inner_plan->targetlist, idx + 1);
-		Assert(tle && IsA(tle->expr, Var));
-		inner_var = makeVar(Inner, tle->resno,
-							exprType((Node *) tle->expr),
-							exprTypmod((Node *) tle->expr), 0);
-
-		/*
-		 * Make join clause for group keys.
-		 */
-		rinfo = make_mergeclause((Node *) outer_var, (Node *) inner_var);
-		join_clause = lappend(join_clause, rinfo);
-	}
-
-	/*
+	 *
 	 * This is similar to make_subplanTargetList(), but things are much simpler.
 	 * Note that this makes sure that expressions like SRF are going to be
 	 * in the upper aggregate target list rather than in this join target list.
@@ -6084,10 +6188,11 @@ within_agg_join_plans(PlannerInfo *root,
 	 */
 	if (root->parse->groupClause && !wag_context->inner_pathkeys)
 	{
-		AttrNumber	   *grpColIdx;
+		AttrNumber *grpColIdx;
+		Oid		   *grpOperators;
 
-		grpColIdx = get_grouplist_colidx(root->parse->groupClause,
-										 inner_plan->targetlist, NULL);
+		get_grouplist_colidx(root->parse->groupClause, inner_plan->targetlist,
+							 NULL, &grpColIdx, &grpOperators);
 		inner_plan = (Plan *)
 			make_sort_from_groupcols(root,
 									 root->parse->groupClause,
@@ -6107,12 +6212,55 @@ within_agg_join_plans(PlannerInfo *root,
 	 * We choose cartesian product if there is no join clauses, meaning
 	 * no grouping happens.
 	 */
-	if (list_length(join_clause) > 0)
+	if (ngroups > 0)
 	{
-		List	   *mergefamilies;
-		List	   *mergestrategies;
-		build_mergejoin_strat_lists(join_clause, &mergefamilies,
-									&mergestrategies);
+		int				idx;
+		ListCell	   *lg;
+		ListCell	   *lpk;
+
+		/* Build merge join clauses for grouping columns */
+		mergefamilies = (Oid *) palloc(ngroups * sizeof(Oid));
+		mergestrategies = (int *) palloc(ngroups * sizeof(int));
+		mergenullsfirst = (bool *) palloc(ngroups * sizeof(bool));
+		join_clause = NIL;
+		idx = 0;
+		forboth(lg, root->parse->groupClause, lpk, wag_context->current_pathkeys)
+		{
+			GroupClause	   *gc = (GroupClause *) lfirst(lg);
+			PathKey		   *pk = (PathKey *) lfirst(lpk);
+			TargetEntry	   *tle;
+			Var			   *outer_var,
+						   *inner_var;
+			RestrictInfo   *rinfo;
+
+			/* Construct outer group key. */
+			tle = get_sortgroupclause_tle(gc, outer_plan->targetlist);
+			Assert(tle && IsA(tle->expr, Var));
+			outer_var = makeVar(Outer, tle->resno,
+								exprType((Node *) tle->expr),
+								exprTypmod((Node *) tle->expr), 0);
+
+			/* Construct inner group keys. */
+			tle = get_tle_by_resno(inner_plan->targetlist, idx + 1);
+			Assert(tle && IsA(tle->expr, Var));
+			inner_var = makeVar(Inner, tle->resno,
+								exprType((Node *) tle->expr),
+								exprTypmod((Node *) tle->expr), 0);
+
+			/* Make join clause for them. */
+			rinfo = make_mergeclause((Node *) outer_var, (Node *) inner_var);
+			join_clause = lappend(join_clause, rinfo);
+
+			/*
+			 * Also fill in the mergefamilies/mergestrategies/mergenullsfirst
+			 * arrays for this. Arbitrarily use the first operator family we
+			 * find.
+			 */
+			mergefamilies[idx] = linitial_oid(rinfo->mergeopfamilies);
+			mergestrategies[idx] = pk->pk_strategy;
+			mergenullsfirst[idx] = pk->pk_nulls_first;
+			idx++;
+		}
 		join_clause = get_actual_clauses(join_clause);
 		result_plan = (Plan *) make_mergejoin(join_tlist,
 											  NIL,
@@ -6120,6 +6268,7 @@ within_agg_join_plans(PlannerInfo *root,
 											  join_clause,
 											  mergefamilies,
 											  mergestrategies,
+											  mergenullsfirst,
 											  outer_plan,
 											  inner_plan,
 											  JOIN_INNER);
@@ -6160,6 +6309,7 @@ within_agg_final_agg(PlannerInfo *root,
 	List					   *percentiles;
 	Var						   *pc_var, *tc_var;
 	AttrNumber				   *grpColIdx;
+	Oid						   *grpOperators;
 	int							numGroupCols;
 	AggClauseCounts				agg_counts;
 	AggStrategy					aggstrategy;
@@ -6193,8 +6343,9 @@ within_agg_final_agg(PlannerInfo *root,
 	 * Prepare GROUP BY clause for the final aggregate.
 	 * Make sure the column indices point to the topmost target list.
 	 */
-	grpColIdx = get_grouplist_colidx(root->parse->groupClause,
-									 result_plan->targetlist, &numGroupCols);
+	get_grouplist_colidx(root->parse->groupClause,
+						 result_plan->targetlist, &numGroupCols,
+						 &grpColIdx, &grpOperators);
 	aggstrategy = root->parse->groupClause ? AGG_SORTED : AGG_PLAIN;
 
 	/* add vars from flow expression: MPP-20076 */
@@ -6210,6 +6361,7 @@ within_agg_final_agg(PlannerInfo *root,
 									false,
 									numGroupCols,
 									grpColIdx,
+									grpOperators,
 									*group_context->p_dNumGroups,
 									0, /* num_nullcols */
 									0, /* input_grouping */
@@ -6425,7 +6577,9 @@ within_agg_planner(PlannerInfo *root,
 	List	  **sortlist;
 	int			numsortlist;
 	int			numGroupCols, numDistinctCols;
-	AttrNumber *grpColIdx, *distinctColIdx;
+	AttrNumber *grpColIdx;
+	Oid		   *grpOperators;
+	AttrNumber *distinctColIdx;
 	int			i;
 	List	   *sub_tlist;
 	AttrNumber	next_resno;
@@ -6459,8 +6613,8 @@ within_agg_planner(PlannerInfo *root,
 	 * that we have denied grouping extension cases.
 	 */
 	Assert(!is_grouping_extension(group_context->canonical_grpsets));
-	grpColIdx = get_grouplist_colidx(
-			root->parse->groupClause, sub_tlist, &numGroupCols);
+	get_grouplist_colidx(root->parse->groupClause, sub_tlist,
+						 &numGroupCols, &grpColIdx, &grpOperators);
 	root->parse->groupClause =
 		reconstruct_group_clause(root->parse->groupClause,
 								 sub_tlist,
@@ -6751,6 +6905,7 @@ within_agg_planner(PlannerInfo *root,
 				/* These fields are not set in grouping_planner */
 				local_group_context.numGroupCols = numGroupCols;
 				local_group_context.groupColIdx = grpColIdx;
+				local_group_context.groupOperators = grpOperators;
 				local_group_context.numDistinctCols = numDistinctCols;
 				local_group_context.distinctColIdx = distinctColIdx;
 
@@ -6813,14 +6968,14 @@ Plan *add_motion_to_dqa_child(Plan *plan, PlannerInfo *root, bool *motion_added)
 	Plan *result = plan;
 	*motion_added = false;
 	
-	List *pathkeys = 	make_pathkeys_for_groupclause(root->parse->groupClause, plan->targetlist);
+	List *pathkeys = 	make_pathkeys_for_groupclause(root, root->parse->groupClause, plan->targetlist);
 	CdbPathLocus locus = cdbpathlocus_from_flow(plan->flow);
 	if (CdbPathLocus_IsPartitioned(locus) && NIL != plan->flow->hashExpr)
 	{
 		locus = cdbpathlocus_from_exprs(root, plan->flow->hashExpr);
 	}
 	
-	if (!cdbpathlocus_collocates(locus, pathkeys, true /*exact_match*/))
+	if (!cdbpathlocus_collocates(root, locus, pathkeys, true /*exact_match*/))
 	{
 		/* MPP-22413: join requires exact distribution match for collocation purposes,
 		 * which may not be provided by the underlying group by, as computing the 

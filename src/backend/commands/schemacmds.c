@@ -8,7 +8,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/schemacmds.c,v 1.41.2.2 2009/12/09 21:58:28 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/schemacmds.c,v 1.43 2007/02/01 19:10:26 momjian Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -33,14 +33,13 @@
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbsrlz.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbcat.h"
 
 static void AlterSchemaOwner_internal(cqContext  *pcqCtx, 
 									  HeapTuple tup, Relation rel, Oid newOwnerId);
-static void RemoveSchema_internal(const char *schemaName, DropBehavior behavior, 
+static void RemoveSchema_internal(const char *namespaceName, DropBehavior behavior,
 								  bool missing_ok, bool is_internal);
 
 
@@ -233,60 +232,62 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString)
 void
 RemoveSchema(List *names, DropBehavior behavior, bool missing_ok)
 {
-	char	   *schemaName;
+	char	   *namespaceName;
 
 	if (list_length(names) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("schema name may not be qualified")));
-	schemaName = strVal(linitial(names));
+				 errmsg("schema name cannot be qualified")));
+	namespaceName = strVal(linitial(names));
 
-	RemoveSchema_internal(schemaName, behavior, missing_ok, false);
+	RemoveSchema_internal(namespaceName, behavior, missing_ok, false);
 }
 
 static void
-RemoveSchema_internal(const char *schemaName, DropBehavior behavior, 
+RemoveSchema_internal(const char *namespaceName, DropBehavior behavior,
 					  bool missing_ok, bool is_internal)
 {
-	Oid				namespaceId;
-	ObjectAddress	object;
+	Oid			namespaceId;
+	ObjectAddress object;
 
 	namespaceId = caql_getoid(
 			NULL,
 			cql("SELECT oid FROM pg_namespace "
 				" WHERE nspname = :1 ",
-				CStringGetDatum(schemaName)));
-
+				CStringGetDatum(namespaceName)));
 	if (!OidIsValid(namespaceId))
 	{
 		if (!missing_ok)
 		{
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_SCHEMA),
-					 errmsg("schema \"%s\" does not exist", schemaName)));
+					 errmsg("schema \"%s\" does not exist", namespaceName)));
 		}
 		if (!is_internal && Gp_role != GP_ROLE_EXECUTE)
 		{
 			ereport(NOTICE,
 					(errcode(ERRCODE_UNDEFINED_SCHEMA),
-					 errmsg("schema \"%s\" does not exist, skipping", 
-							schemaName)));
+					 errmsg("schema \"%s\" does not exist, skipping",
+							namespaceName)));
 		}
+
 		return;
 	}
 
 	/* Permission check */
 	if (!is_internal && !pg_namespace_ownercheck(namespaceId, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_NAMESPACE,
-					   schemaName);
+					   namespaceName);
 
 	/* Additional check to protect reserved schema names, exclude temp schema */
-	if (!is_internal && !allowSystemTableModsDDL && IsReservedName(schemaName) &&
-        (strlen(schemaName)>=7 && strncmp(schemaName, "pg_temp", 7)!=0))
+	if (!is_internal && !allowSystemTableModsDDL &&
+		IsReservedName(namespaceName) &&
+        (strlen(namespaceName)>=7 && strncmp(namespaceName, "pg_temp", 7)!=0))
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_RESERVED_NAME),
-				 errmsg("cannot drop schema %s because it is required by the database system", schemaName)));
+				 errmsg("cannot drop schema %s because it is required by the database system",
+						namespaceName)));
 	}
 
 	/*

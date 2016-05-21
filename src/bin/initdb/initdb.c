@@ -42,7 +42,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions taken from FreeBSD.
  *
- * $PostgreSQL: pgsql/src/bin/initdb/initdb.c,v 1.128 2007/01/06 19:40:00 momjian Exp $
+ * $PostgreSQL: pgsql/src/bin/initdb/initdb.c,v 1.133 2007/02/16 02:10:07 alvherre Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -1170,31 +1170,26 @@ check_input(char *path)
 	if (stat(path, &statbuf) != 0)
 	{
 		if (errno == ENOENT)
-		{
 			fprintf(stderr,
-					_("%s: file \"%s\" does not exist\n"), progname, path);
-			fprintf(stderr,
-					_("This might mean you have a corrupted installation or identified\n"
-					  "the wrong directory with the invocation option -L.\n"));
-		}
+					_("%s: file \"%s\" does not exist\n"
+					  "This means you have a corrupted installation or identified\n"
+					  "the wrong directory with the invocation option -L.\n"),
+					progname, path);
 		else
-	{
 			fprintf(stderr,
-					_("%s: could not access file \"%s\": %s\n"), progname, path,
-					  strerror(errno));
-			fprintf(stderr,
-					_("This might mean you have a corrupted installation or identified\n"
-					  "the wrong directory with the invocation option -L.\n"));
-		}
+					_("%s: could not access file \"%s\": %s\n"
+					  "This might mean you have a corrupted installation or identified\n"
+					  "the wrong directory with the invocation option -L.\n"),
+					progname, path, strerror(errno));
 		exit(1);
 	}
 	if (!S_ISREG(statbuf.st_mode))
 	{
 		fprintf(stderr,
-				_("%s: file \"%s\" is not a regular file\n"), progname, path);
-		fprintf(stderr,
-				_("This might mean you have a corrupted installation or identified\n"
-				  "the wrong directory with the invocation option -L.\n"));
+				_("%s: file \"%s\" is not a regular file\n"
+			   "This means you have a corrupted installation or identified\n"
+				  "the wrong directory with the invocation option -L.\n"),
+				progname, path);
 		exit(1);
 	}
 }
@@ -2867,7 +2862,7 @@ usage(const char *progname)
 	printf(_("  -m, --formirror           only create data needed to start the backend in mirror mode\n"));
 	printf(_("\nIf the data directory is not specified, the environment variable PGDATA\n"
 			 "is used.\n"));
-	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("\nReport bugs to <bugs@greenplum.org>.\n"));
 }
 
 int

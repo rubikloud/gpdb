@@ -14,7 +14,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/commands/dbcommands.c,v 1.187.2.4 2010/03/25 14:45:21 alvherre Exp $
+ *	  $PostgreSQL: pgsql/src/backend/commands/dbcommands.c,v 1.192 2007/02/09 16:12:18 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -47,6 +47,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/checkpoint.h"
+#include "postmaster/bgwriter.h"
 #include "storage/freespace.h"
 #include "storage/ipc.h"
 #include "storage/procarray.h"
@@ -60,12 +61,11 @@
 #include "utils/pg_locale.h"
 #include "utils/syscache.h"
 
-#include "cdb/cdbdisp.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbsreh.h"
 #include "cdb/cdbsrlz.h"
 #include "cdb/cdbvars.h"
-#include "cdb/cdbcat.h"
 #include "cdb/cdbpersistentdatabase.h"
 #include "cdb/cdbpersistentrelation.h"
 #include "cdb/cdbmirroredfilesysobj.h"
@@ -824,17 +824,6 @@ createdb_int(CreatedbStmt *stmt, CdbDispatcherState *ds)
 							dbtemplate)));
 	}
 
-	/*
-	 * The source DB can't have any active backends, except this one
-	 * (exception is to allow CREATE DB while connected to template1).
-	 * Otherwise we might copy inconsistent data.
-	 */
-	if (DatabaseHasActiveBackends(src_dboid, true))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-			errmsg("source database \"%s\" is being accessed by other users",
-				   dbtemplate)));
-
 	/* If encoding is defaulted, use source's encoding */
 	if (encoding < 0)
 		encoding = src_encoding;
@@ -945,6 +934,21 @@ createdb_int(CreatedbStmt *stmt, CdbDispatcherState *ds)
 		ereport(ERROR,
 				(errcode(ERRCODE_DUPLICATE_DATABASE),
 				 errmsg("database \"%s\" already exists", dbname)));
+
+	/*
+	 * The source DB can't have any active backends, except this one
+	 * (exception is to allow CREATE DB while connected to template1).
+	 * Otherwise we might copy inconsistent data.
+	 *
+	 * This should be last among the basic error checks, because it involves
+	 * potential waiting; we may as well throw an error first if we're gonna
+	 * throw one.
+	 */
+	if (CheckOtherDBBackends(src_dboid))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("source database \"%s\" is being accessed by other users",
+						dbtemplate)));
 
 	/*
 	 * Select an OID for the new database, checking that it doesn't have
@@ -1324,8 +1328,6 @@ dropdb(const char *dbname, bool missing_ok)
 	Oid			defaultTablespace = InvalidOid;
 	Relation	pgdbrel;
 
-	AssertArg(dbname);
-
 	if (Gp_role != GP_ROLE_EXECUTE)
 	{
 		/*
@@ -1334,11 +1336,6 @@ dropdb(const char *dbname, bool missing_ok)
 		 */
 		PreventTransactionChain((void *) dbname, "DROP DATABASE");
 	}
-
-	if (strcmp(dbname, get_database_name(MyDatabaseId)) == 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("cannot drop the currently open database")));
 
 	/*
 	 * Look up the target database's OID, and get exclusive lock on it. We
@@ -1401,11 +1398,19 @@ dropdb(const char *dbname, bool missing_ok)
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
 				 errmsg("cannot drop a template database")));
 
+	/* Obviously can't drop my own database */
+	if (db_id == MyDatabaseId)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("cannot drop the currently open database")));
+
 	/*
-	 * Check for active backends in the target database.  (Because we hold the
+	 * Check for other backends in the target database.  (Because we hold the
 	 * database lock, no new ones can start after this.)
+	 *
+	 * As in CREATE DATABASE, check this after other error conditions.
 	 */
-	if (DatabaseHasActiveBackends(db_id, false))
+	if (CheckOtherDBBackends(db_id))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
 				 errmsg("database \"%s\" is being accessed by other users",
@@ -1471,11 +1476,21 @@ dropdb(const char *dbname, bool missing_ok)
 	FreeSpaceMapForgetDatabase(InvalidOid, db_id);
 
 	/*
+	 * Tell the stats collector to forget it immediately, too.
+	 */
+	pgstat_drop_database(db_id);
+
+	/*
+	 * Tell bgwriter to forget any pending fsync requests for files in the
+	 * database; else it'll fail at next checkpoint.
+	 */
+	ForgetDatabaseFsyncRequests(InvalidOid, db_id);
+
+	/*
 	 * Force a checkpoint to make sure the bgwriter to push all pages to disk.
 	 */
 	RequestCheckpoint(true, false);
 
-	
 	/*
 	 * Collect information on the database's relations from pg_class and from scanning
 	 * the file-system directories.
@@ -1649,33 +1664,6 @@ RenameDatabase(const char *oldname, const char *newname)
 				(errcode(ERRCODE_UNDEFINED_DATABASE),
 				 errmsg("database \"%s\" does not exist", oldname)));
 
-	/*
-	 * XXX Client applications probably store the current database somewhere,
-	 * so renaming it could cause confusion.  On the other hand, there may not
-	 * be an actual problem besides a little confusion, so think about this
-	 * and decide.
-	 */
-	if (db_id == MyDatabaseId)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("current database may not be renamed")));
-
-	/*
-	 * Make sure the database does not have active sessions.  This is the same
-	 * concern as above, but applied to other sessions.
-	 */
-	if (DatabaseHasActiveBackends(db_id, false))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database \"%s\" is being accessed by other users",
-						oldname)));
-
-	/* make sure the new name doesn't exist */
-	if (OidIsValid(get_database_oid(newname)))
-		ereport(ERROR,
-				(errcode(ERRCODE_DUPLICATE_DATABASE),
-				 errmsg("database \"%s\" already exists", newname)));
-
 	/* must be owner */
 	if (!pg_database_ownercheck(db_id, GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
@@ -1686,6 +1674,38 @@ RenameDatabase(const char *oldname, const char *newname)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to rename database")));
+
+	/*
+	 * Make sure the new name doesn't exist.  See notes for same error in
+	 * CREATE DATABASE.
+	 */
+	if (OidIsValid(get_database_oid(newname)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DUPLICATE_DATABASE),
+				 errmsg("database \"%s\" already exists", newname)));
+
+	/*
+	 * XXX Client applications probably store the current database somewhere,
+	 * so renaming it could cause confusion.  On the other hand, there may not
+	 * be an actual problem besides a little confusion, so think about this
+	 * and decide.
+	 */
+	if (db_id == MyDatabaseId)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("current database cannot be renamed")));
+
+	/*
+	 * Make sure the database does not have active sessions.  This is the same
+	 * concern as above, but applied to other sessions.
+	 *
+	 * As in CREATE DATABASE, check this after other error conditions.
+	 */
+	if (CheckOtherDBBackends(db_id))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("database \"%s\" is being accessed by other users",
+						oldname)));
 
 	/* rename */
 
@@ -2033,6 +2053,7 @@ AlterDatabaseOwner(const char *dbname, Oid newOwnerId)
 	cqContext  *pcqCtx;
 	Form_pg_database datForm;
 	Oid			dboid = InvalidOid;
+
 	/*
 	 * Get the old tuple.  We don't need a lock on the database per se,
 	 * because we're not going to do anything that would mess up incoming

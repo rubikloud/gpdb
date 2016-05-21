@@ -125,34 +125,44 @@
 
 	/* Read an integer array */
 #define WRITE_INT_ARRAY(fldname, count, Type) \
-	if ( node->count > 0 ) \
+	if ( count > 0 ) \
 	{ \
 		int i; \
-		for(i=0; i<node->count; i++) \
+		for(i = 0; i < count; i++) \
 		{ \
 			appendBinaryStringInfo(str, (const char *)&node->fldname[i], sizeof(Type)); \
 		} \
 	}
 
-/* Write an Trasnaction ID array  */
-#define WRITE_XID_ARRAY(fldname, count) \
-	if ( node->count > 0 ) \
+/* Write a boolean array  */
+#define WRITE_BOOL_ARRAY(fldname, count) \
+	if ( count > 0 ) \
 	{ \
 		int i; \
-		for(i=0; i<node->count; i++) \
+		for(i = 0; i < count; i++) \
+		{ \
+			char b = node->fldname[i] ? 1 : 0;								\
+			appendBinaryStringInfo(str, (const char *)&b, 1); \
+		} \
+	}
+
+/* Write an Trasnaction ID array  */
+#define WRITE_XID_ARRAY(fldname, count) \
+	if ( count > 0 ) \
+	{ \
+		int i; \
+		for(i = 0; i < count; i++) \
 		{ \
 			appendBinaryStringInfo(str, (const char *)&node->fldname[i], sizeof(TransactionId)); \
 		} \
 	}
 
-
-
 /* Write an Oid array  */
 #define WRITE_OID_ARRAY(fldname, count) \
-	if ( node->count > 0 ) \
+	if ( count > 0 ) \
 	{ \
 		int i; \
-		for(i=0; i<node->count; i++) \
+		for(i = 0; i < count; i++) \
 		{ \
 			appendBinaryStringInfo(str, (const char *)&node->fldname[i], sizeof(Oid)); \
 		} \
@@ -353,7 +363,7 @@ outLogicalIndexInfo(StringInfo str, LogicalIndexInfo *node)
 {
 	WRITE_OID_FIELD(logicalIndexOid);
 	WRITE_INT_FIELD(nColumns);
-	WRITE_INT_ARRAY(indexKeys, nColumns, AttrNumber);
+	WRITE_INT_ARRAY(indexKeys, node->nColumns, AttrNumber);
 	WRITE_NODE_FIELD(indPred);
 	WRITE_NODE_FIELD(indExprs);
 	WRITE_BOOL_FIELD(indIsUnique);
@@ -374,6 +384,26 @@ _outSubqueryScan(StringInfo str, SubqueryScan *node)
 }
 
 static void
+_outMergeJoin(StringInfo str, MergeJoin *node)
+{
+	int			numCols;
+
+	WRITE_NODE_TYPE("MERGEJOIN");
+
+	_outJoinPlanInfo(str, (Join *) node);
+
+	WRITE_NODE_FIELD(mergeclauses);
+
+	numCols = list_length(node->mergeclauses);
+
+	WRITE_OID_ARRAY(mergeFamilies, numCols);
+	WRITE_INT_ARRAY(mergeStrategies, numCols, int);
+	WRITE_BOOL_ARRAY(mergeNullsFirst, numCols);
+
+	WRITE_BOOL_FIELD(unique_outer);
+}
+
+static void
 _outAgg(StringInfo str, Agg *node)
 {
 
@@ -384,7 +414,8 @@ _outAgg(StringInfo str, Agg *node)
 	WRITE_ENUM_FIELD(aggstrategy, AggStrategy);
 	WRITE_INT_FIELD(numCols);
 
-	WRITE_INT_ARRAY(grpColIdx, numCols, AttrNumber);
+	WRITE_INT_ARRAY(grpColIdx, node->numCols, AttrNumber);
+	WRITE_OID_ARRAY(grpOperators, node->numCols);
 
 	if (print_variable_fields)
 	{
@@ -406,8 +437,8 @@ _outWindowKey(StringInfo str, WindowKey *node)
 	WRITE_NODE_TYPE("WINDOWKEY");
 	WRITE_INT_FIELD(numSortCols);
 
-	WRITE_INT_ARRAY(sortColIdx, numSortCols, AttrNumber);
-	WRITE_OID_ARRAY(sortOperators, numSortCols);
+	WRITE_INT_ARRAY(sortColIdx, node->numSortCols, AttrNumber);
+	WRITE_OID_ARRAY(sortOperators, node->numSortCols);
 	WRITE_NODE_FIELD(frame);
 }
 
@@ -420,8 +451,8 @@ _outWindow(StringInfo str, Window *node)
 	_outPlanInfo(str, (Plan *) node);
 
 	WRITE_INT_FIELD(numPartCols);
-
-	WRITE_INT_ARRAY(partColIdx, numPartCols, AttrNumber);
+	WRITE_INT_ARRAY(partColIdx, node->numPartCols, AttrNumber);
+	WRITE_OID_ARRAY(partOperators, node->numPartCols);
 
 	WRITE_NODE_FIELD(windowKeys);
 }
@@ -435,10 +466,9 @@ _outSort(StringInfo str, Sort *node)
 	_outPlanInfo(str, (Plan *) node);
 
 	WRITE_INT_FIELD(numCols);
-
-	WRITE_INT_ARRAY(sortColIdx, numCols, AttrNumber);
-
-	WRITE_OID_ARRAY(sortOperators, numCols);
+	WRITE_INT_ARRAY(sortColIdx, node->numCols, AttrNumber);
+	WRITE_OID_ARRAY(sortOperators, node->numCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numCols);
 
     /* CDB */
 	WRITE_NODE_FIELD(limitOffset);
@@ -461,9 +491,8 @@ _outUnique(StringInfo str, Unique *node)
 	_outPlanInfo(str, (Plan *) node);
 
 	WRITE_INT_FIELD(numCols);
-
-	WRITE_INT_ARRAY(uniqColIdx, numCols, AttrNumber);
-
+	WRITE_INT_ARRAY(uniqColIdx, node->numCols, AttrNumber);
+	WRITE_OID_ARRAY(uniqOperators, node->numCols);
 }
 
 static void
@@ -476,8 +505,8 @@ _outSetOp(StringInfo str, SetOp *node)
 
 	WRITE_ENUM_FIELD(cmd, SetOpCmd);
 	WRITE_INT_FIELD(numCols);
-
-	WRITE_INT_ARRAY(dupColIdx, numCols, AttrNumber);
+	WRITE_INT_ARRAY(dupColIdx, node->numCols, AttrNumber);
+	WRITE_OID_ARRAY(dupOperators, node->numCols);
 
 	WRITE_INT_FIELD(flagColIdx);
 }
@@ -496,11 +525,12 @@ _outMotion(StringInfo str, Motion *node)
 	WRITE_NODE_FIELD(hashDataTypes);
 
 	WRITE_INT_FIELD(numOutputSegs);
-	WRITE_INT_ARRAY(outputSegIdx, numOutputSegs, int);
+	WRITE_INT_ARRAY(outputSegIdx, node->numOutputSegs, int);
 
 	WRITE_INT_FIELD(numSortCols);
-	WRITE_INT_ARRAY(sortColIdx, numSortCols, AttrNumber);
-	WRITE_OID_ARRAY(sortOperators, numSortCols);
+	WRITE_INT_ARRAY(sortColIdx, node->numSortCols, AttrNumber);
+	WRITE_OID_ARRAY(sortOperators, node->numSortCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numSortCols);
 
 	WRITE_INT_FIELD(segidColIdx);
 
@@ -621,9 +651,11 @@ _outFlow(StringInfo str, Flow *node)
 	/* This array format as in Group and Sort nodes. */
 	WRITE_INT_FIELD(numSortCols);
 
-	WRITE_INT_ARRAY(sortColIdx, numSortCols, AttrNumber);
-	WRITE_OID_ARRAY(sortOperators, numSortCols);
+	WRITE_INT_ARRAY(sortColIdx, node->numSortCols, AttrNumber);
+	WRITE_OID_ARRAY(sortOperators, node->numSortCols);
+	WRITE_BOOL_ARRAY(nullsFirst, node->numSortCols);
 
+	WRITE_INT_FIELD(numOrderbyCols);
 
 	WRITE_NODE_FIELD(hashExpr);
 
@@ -648,10 +680,10 @@ _outIndexOptInfo(StringInfo str, IndexOptInfo *node)
 	WRITE_FLOAT_FIELD(tuples, "%.0f");
 	WRITE_INT_FIELD(ncolumns);
 
-	WRITE_INT_ARRAY(opfamily, ncolumns, int);
-	WRITE_INT_ARRAY(indexkeys, ncolumns, int);
-	WRITE_INT_ARRAY(ordering, ncolumns, int);
-
+	WRITE_OID_ARRAY(opfamily, node->ncolumns);
+	WRITE_INT_ARRAY(indexkeys, node->ncolumns, int);
+	WRITE_OID_ARRAY(fwdsortop, node->ncolumns);
+	WRITE_OID_ARRAY(revsortop, node->ncolumns);
 
     WRITE_OID_FIELD(relam);
 	WRITE_OID_FIELD(amcostestimate);
@@ -697,6 +729,7 @@ _outCreateStmt(StringInfo str, CreateStmt *node)
 	WRITE_NODE_FIELD(distributedBy);
 	WRITE_OID_FIELD(oidInfo.relOid);
 	WRITE_OID_FIELD(oidInfo.comptypeOid);
+	WRITE_OID_FIELD(oidInfo.comptypeArrayOid);
 	WRITE_OID_FIELD(oidInfo.toastOid);
 	WRITE_OID_FIELD(oidInfo.toastIndexOid);
 	WRITE_OID_FIELD(oidInfo.toastComptypeOid);
@@ -719,7 +752,6 @@ _outCreateStmt(StringInfo str, CreateStmt *node)
 	WRITE_BOOL_FIELD(is_split_part);
 	WRITE_OID_FIELD(ownerid);
 	WRITE_BOOL_FIELD(buildAoBlkdir);
-	WRITE_BOOL_FIELD(is_error_table);
 	WRITE_NODE_FIELD(attr_encodings);
 }
 
@@ -755,8 +787,8 @@ _outPartition(StringInfo str, Partition *node)
 	WRITE_INT_FIELD(parlevel);
 	WRITE_BOOL_FIELD(paristemplate);
 	WRITE_BINARY_FIELD(parnatts, sizeof(int2));
-	WRITE_INT_ARRAY(paratts, parnatts, int2);
-	WRITE_OID_ARRAY(parclass, parnatts);
+	WRITE_INT_ARRAY(paratts, node->parnatts, int2);
+	WRITE_OID_ARRAY(parclass, node->parnatts);
 }
 
 static void
@@ -1149,7 +1181,6 @@ _outNode(StringInfo str, void *obj)
 	{
 		int16 tg = 0;
 		appendBinaryStringInfo(str, (const char *)&tg, sizeof(int16));
-		return;
 	}
 	else if (IsA(obj, List) ||IsA(obj, IntList) || IsA(obj, OidList))
 		_outList(str, obj);
@@ -1163,7 +1194,6 @@ _outNode(StringInfo str, void *obj)
 	}
 	else
 	{
-
 		switch (nodeTag(obj))
 		{
 			case T_PlannedStmt:
@@ -1364,6 +1394,12 @@ _outNode(StringInfo str, void *obj)
 			case T_RelabelType:
 				_outRelabelType(str, obj);
 				break;
+			case T_CoerceViaIO:
+				_outCoerceViaIO(str, obj);
+				break;
+			case T_ArrayCoerceExpr:
+				_outArrayCoerceExpr(str, obj);
+				break;
 			case T_ConvertRowtypeExpr:
 				_outConvertRowtypeExpr(str, obj);
 				break;
@@ -1485,6 +1521,9 @@ _outNode(StringInfo str, void *obj)
 			case T_PlannerInfo:
 				_outPlannerInfo(str, obj);
 				break;
+			case T_PlannerParamItem:
+				_outPlannerParamItem(str, obj);
+				break;
 			case T_RelOptInfo:
 				_outRelOptInfo(str, obj);
 				break;
@@ -1494,8 +1533,8 @@ _outNode(StringInfo str, void *obj)
 			case T_CdbRelDedupInfo:
 				_outCdbRelDedupInfo(str, obj);
 				break;
-			case T_PathKeyItem:
-				_outPathKeyItem(str, obj);
+			case T_PathKey:
+				_outPathKey(str, obj);
 				break;
 			case T_RestrictInfo:
 				_outRestrictInfo(str, obj);
@@ -1621,8 +1660,17 @@ _outNode(StringInfo str, void *obj)
 			case T_CreateOpClassItem:
 				_outCreateOpClassItem(str,obj);
 				break;
+			case T_CreateOpFamilyStmt:
+				_outCreateOpFamilyStmt(str,obj);
+				break;
+			case T_AlterOpFamilyStmt:
+				_outAlterOpFamilyStmt(str,obj);
+				break;
 			case T_RemoveOpClassStmt:
 				_outRemoveOpClassStmt(str,obj);
+				break;
+			case T_RemoveOpFamilyStmt:
+				_outRemoveOpFamilyStmt(str,obj);
 				break;
 			case T_CreateConversionStmt:
 				_outCreateConversionStmt(str,obj);
@@ -1655,6 +1703,9 @@ _outNode(StringInfo str, void *obj)
 				break;
 			case T_AlterTableCmd:
 				_outAlterTableCmd(str, obj);
+				break;
+			case T_SetDistributionCmd:
+				_outSetDistributionCmd(str, obj);
 				break;
 			case T_InheritPartitionCmd:
 				_outInheritPartitionCmd(str, obj);
@@ -1811,6 +1862,9 @@ _outNode(StringInfo str, void *obj)
 			case T_A_Indirection:
 				_outA_Indirection(str, obj);
 				break;
+			case T_A_ArrayExpr:
+				_outA_ArrayExpr(str,obj);
+				break;
 			case T_ResTarget:
 				_outResTarget(str, obj);
 				break;
@@ -1933,7 +1987,6 @@ _outNode(StringInfo str, void *obj)
 						 (int) nodeTag(obj));
 				break;
 		}
-
 	}
 }
 

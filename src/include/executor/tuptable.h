@@ -19,6 +19,7 @@
 #include "access/heapam.h"
 #include "access/memtup.h"
 #include "storage/buf.h"
+#include "codegen/codegen_wrapper.h"
 
 /*----------
  * The executor stores tuples in a "tuple table" which is composed of
@@ -382,7 +383,7 @@ extern TupleTableSlot *ExecStoreHeapTuple(HeapTuple tuple,
 			   TupleTableSlot *slot,
 			   Buffer buffer,
 			   bool shouldFree);
-extern TupleTableSlot *ExecStoreMemTuple(MemTuple mtup,
+extern TupleTableSlot *ExecStoreMinimalTuple(MemTuple mtup,
 					  TupleTableSlot *slot,
 					  bool shouldFree);
 
@@ -391,7 +392,6 @@ extern TupleTableSlot *ExecStoreVirtualTuple(TupleTableSlot *slot);
 extern TupleTableSlot *ExecStoreAllNullTuple(TupleTableSlot *slot);
 
 extern HeapTuple ExecCopySlotHeapTuple(TupleTableSlot *slot);
-extern HeapTuple ExecCopySlotHeapTupleTo(TupleTableSlot *slot, MemoryContext pctxt, char *dest, unsigned int *len);
 extern MemTuple ExecCopySlotMemTuple(TupleTableSlot *slot);
 extern MemTuple ExecCopySlotMemTupleTo(TupleTableSlot *slot, MemoryContext pctxt, char *dest, unsigned int *len);
 
@@ -411,8 +411,8 @@ static inline void *ExecFetchSlotGenericTuple(TupleTableSlot *slot, bool mtup_in
 
 static inline TupleTableSlot *ExecStoreGenericTuple(void *tup, TupleTableSlot *slot, bool shouldFree)
 {
-	if(is_heaptuple_memtuple((HeapTuple) tup))
-		return ExecStoreMemTuple((MemTuple) tup, slot, shouldFree);
+	if (is_heaptuple_memtuple((HeapTuple) tup))
+		return ExecStoreMinimalTuple((MemTuple) tup, slot, shouldFree);
 
 	return ExecStoreHeapTuple((HeapTuple) tup, slot, InvalidBuffer, shouldFree);
 }

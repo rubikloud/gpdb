@@ -12,13 +12,18 @@
 #include "catalog/catquery.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
+#include "commands/tablecmds.h"
+#include "optimizer/planmain.h"
 #include "optimizer/planpartition.h"
 #include "optimizer/walkers.h"
 #include "optimizer/clauses.h"
 #include "optimizer/restrictinfo.h"
-#include "cdb/cdbplan.h"
-#include "parser/parsetree.h"
+#include "optimizer/subselect.h"
+#include "cdb/cdbllize.h"
 #include "cdb/cdbpartition.h"
+#include "cdb/cdbplan.h"
+#include "cdb/cdbsetop.h"
+#include "parser/parsetree.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -30,26 +35,6 @@
 #include "parser/parse_expr.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_oper.h"
-
-extern PartitionNode *RelationBuildPartitionDescByOid(Oid relid,
-												 bool inctemplate);
-extern Result *make_result(List *tlist, Node *resconstantqual, Plan *subplan);
-extern bool is_plan_node(Node *node);
-extern Motion* make_motion_gather_to_QD(Plan *subplan, bool keep_ordering);
-extern Agg *make_agg(PlannerInfo *root, List *tlist, List *qual,
-					 AggStrategy aggstrategy, bool streaming,
-					 int numGroupCols, AttrNumber *grpColIdx,
-					 long numGroups, int numNullCols,
-					 uint64 inputGrouping, uint64 grouping,
-					 int rollupGSTimes,
-					 int numAggs, int transSpace,
-					 Plan *lefttree);
-extern Flow *pull_up_Flow(Plan *plan, Plan *subplan, bool withSort);
-extern Param *SS_make_initplan_from_plan(PlannerInfo *root, Plan *plan,
-						   Oid resulttype, int32 resulttypmod);
-extern Oid exprType(Node *expr);
-extern void mark_plan_strewn(Plan* plan);
-extern Plan * plan_pushdown_tlist(Plan *plan, List *tlist);
 
 extern bool	gp_log_dynamic_partition_pruning;
 
@@ -858,6 +843,7 @@ static void ConstructInitPlan(PartitionJoinMutatorContext *ctx)
 					AGG_PLAIN, false /* streaming */,
 					0 /* numGroupCols */,
 					NULL /* grpColIdx */,
+					NULL /* grpOperators */,
 					0 /* numGroups */,
 					0 /* int num_nullcols */,
 					0 /* input_grouping */,
@@ -1078,6 +1064,10 @@ static void InitPMI(PartitionMatchInfo *pmi, Oid partitionOid, MemoryContext mct
 
 	pmi->partitionOid = partitionOid;
 	pmi->partitionInfo = RelationBuildPartitionDescByOid(pmi->partitionOid, false);
+	if (!pmi->partitionInfo)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_TABLE),
+				 errmsg("relation with OID %u does not exist", partitionOid)));
 
 	pmi->partitionState = createPartitionState(pmi->partitionInfo, 0);
 
@@ -1306,9 +1296,6 @@ make_mergeclause(Node *outer, Node *inner)
 	OpExpr	   *opxpr;
 	Expr	   *xpr;
 	RestrictInfo *rinfo;
-	Oid			leftOp;
-	Oid			rightOp;
-	Oid			opfamily;
 
 	opxpr = (OpExpr *) make_op(NULL, list_make1(makeString("=")),
 							   outer,
@@ -1318,15 +1305,7 @@ make_mergeclause(Node *outer, Node *inner)
 	xpr = make_notclause((Expr *) opxpr);
 
 	rinfo = make_restrictinfo(xpr, false, false, false, NULL);
-	/* fill in opfamily and other fields, like check_mergejoinable does */
-	if (get_op_mergejoin_info(opxpr->opno, &leftOp, &rightOp, &opfamily))
-	{
-		rinfo->mergejoinoperator = opxpr->opno;
-		rinfo->left_sortop = leftOp;
-		rinfo->right_sortop = rightOp;
-		rinfo->mergeopfamily = opfamily;
-	}
-	else
-		elog(ERROR, "partition key not mergejoinable");
+	rinfo->mergeopfamilies = get_mergejoin_opfamilies(opxpr->opno);
+
 	return rinfo;
 }

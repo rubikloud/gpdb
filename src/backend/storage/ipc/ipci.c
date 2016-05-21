@@ -28,7 +28,6 @@
 #include "cdb/cdbfilerepprimaryack.h"
 #include "cdb/cdbfilerepprimaryrecovery.h"
 #include "cdb/cdbfilerepresyncmanager.h"
-#include "cdb/cdbfilerepverify.h"
 #include "cdb/cdblocaldistribxact.h"
 #include "cdb/cdbpersistentfilesysobj.h"
 #include "cdb/cdbpersistentfilespace.h"
@@ -59,6 +58,7 @@
 #include "storage/spin.h"
 #include "utils/resscheduler.h"
 #include "utils/faultinjector.h"
+#include "utils/sharedsnapshot.h"
 #include "utils/simex.h"
 
 #include "cdb/cdbfts.h"
@@ -193,7 +193,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 			size = add_size(size, FileRepIpc_ShmemSize());
 			size = add_size(size, FileRepLog_ShmemSize());
 			size = add_size(size, FileRepStats_ShmemSize());
-			size = add_size(size, FileRepVerifyShmemSize());
 		}
 		
 #ifdef FAULT_INJECTOR
@@ -391,7 +390,6 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		FileRepIpc_ShmemInit();
 		FileRepLog_ShmemInit();
 		FileRepStats_ShmemInit();
-		FileRepVerifyShmemInit();
 	}
 	
 #ifdef FAULT_INJECTOR

@@ -9,7 +9,7 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/indexing.h,v 1.97 2007/01/05 22:19:52 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/catalog/indexing.h,v 1.98 2007/02/14 01:58:58 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -199,9 +199,6 @@ DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698, on pg_tablespace using b
 /* This following index is not used for a cache and is not unique */
 DECLARE_INDEX(pg_trigger_tgconstrname_index, 2699, on pg_trigger using btree(tgconstrname name_ops));
 #define TriggerConstrNameIndexId  2699
-/* This following index is not used for a cache and is not unique */
-DECLARE_INDEX(pg_trigger_tgconstrrelid_index, 2700, on pg_trigger using btree(tgconstrrelid oid_ops));
-#define TriggerConstrRelidIndexId  2700
 DECLARE_UNIQUE_INDEX(pg_trigger_tgrelid_tgname_index, 2701, on pg_trigger using btree(tgrelid oid_ops, tgname name_ops));
 #define TriggerRelidNameIndexId  2701
 DECLARE_UNIQUE_INDEX(pg_trigger_oid_index, 2702, on pg_trigger using btree(oid oid_ops));
@@ -220,9 +217,6 @@ DECLARE_UNIQUE_INDEX(pg_appendonly_relid_index, 5007, on pg_appendonly using btr
 
 DECLARE_UNIQUE_INDEX(gp_fastsequence_objid_objmod_index, 6067, on gp_fastsequence using btree(objid oid_ops, objmod  int8_ops));
 #define FastSequenceObjidObjmodIndexId 6067
-
-DECLARE_UNIQUE_INDEX(pg_appendonly_alter_column_relid_index, 5031, on pg_appendonly_alter_column using btree(relid oid_ops, changenum int4_ops));
-#define AppendOnlyAlterColumnRelidIndexId  5031
 
 DECLARE_UNIQUE_INDEX(gp_relation_node_index, 5095, on gp_relation_node using btree(relfilenode_oid oid_ops, segment_file_num int4_ops));
 #define GpRelationNodeOidIndexId  5095
@@ -368,9 +362,6 @@ DECLARE_UNIQUE_INDEX(pg_attribute_encoding_attrelid_attnum_index, 3237, on pg_at
 /* relation id: 3220 - pg_type_encoding 20110727 */
 DECLARE_UNIQUE_INDEX(pg_type_encoding_typid_index, 3207, on pg_type_encoding using btree(typid oid_ops));
 #define TypeEncodingTypidIndexId	3207
-/* relation id: 6429 - gp_verification_history 20110609 */
-DECLARE_UNIQUE_INDEX(gp_verification_history_vertoken_index, 6431, on gp_verification_history using btree(vertoken name_ops));
-#define GpVerificationHistoryVertokenIndexId	6431
 /* relation id: 9903 - pg_partition_encoding 20110814 */
 DECLARE_UNIQUE_INDEX(pg_partition_encoding_parencoid_parencattnum_index, 9908, on pg_partition_encoding using btree(parencoid oid_ops, parencattnum int2_ops));
 #define PartitionEncodingParencoidAttnumIndexId	9908

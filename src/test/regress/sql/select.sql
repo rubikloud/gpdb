@@ -139,6 +139,62 @@ SELECT 2+2, 57
 UNION ALL
 SELECT * FROM int8_tbl;
 
+
+--
+-- Test ORDER BY options
+--
+
+CREATE TEMP TABLE foo (f1 int);
+
+INSERT INTO foo VALUES (42),(3),(10),(7),(null),(null),(1);
+
+SELECT * FROM foo ORDER BY f1;
+SELECT * FROM foo ORDER BY f1 ASC;	-- same thing
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+SELECT * FROM foo ORDER BY f1 DESC;
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+
+-- check if indexscans do the right things
+CREATE INDEX fooi ON foo (f1);
+SET enable_sort = false;
+
+SELECT * FROM foo ORDER BY f1;
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+SELECT * FROM foo ORDER BY f1 DESC;
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+
+DROP INDEX fooi;
+CREATE INDEX fooi ON foo (f1 DESC);
+
+SELECT * FROM foo ORDER BY f1;
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+SELECT * FROM foo ORDER BY f1 DESC;
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+
+DROP INDEX fooi;
+CREATE INDEX fooi ON foo (f1 DESC NULLS LAST);
+
+SELECT * FROM foo ORDER BY f1;
+SELECT * FROM foo ORDER BY f1 NULLS FIRST;
+SELECT * FROM foo ORDER BY f1 DESC;
+SELECT * FROM foo ORDER BY f1 DESC NULLS LAST;
+
+--
+-- Test some corner cases that have been known to confuse the planner
+--
+
+-- ORDER BY on a constant doesn't really need any sorting
+SELECT 1 AS x ORDER BY x;
+
+-- But ORDER BY on a set-valued expression does
+create function sillysrf(int) returns setof int as
+  'values (1),(10),(2),($1)' language sql immutable;
+
+select sillysrf(42);
+select sillysrf(-1) order by 1;
+
+drop function sillysrf(int);
+
 -- Test unsupported sorting operators
 CREATE TABLE nosort (i int);
 INSERT INTO nosort VALUES(1), (2);
@@ -168,4 +224,3 @@ select x, select_f(x) from (values (0), (1), (2), (3), (4), (5), (6)) r(x);
 drop table if exists select_t cascade; --ignore
 drop function if exists select_i(int); -- ignore
 drop function if exists select_f(int); -- ignore
-

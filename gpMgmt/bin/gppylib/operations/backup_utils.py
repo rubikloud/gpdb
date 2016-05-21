@@ -1,6 +1,7 @@
 import fnmatch
 import glob
 import os
+import re
 import tempfile
 from gppylib import gplog
 from gppylib.commands.base import WorkerPool, Command, REMOTE
@@ -9,6 +10,8 @@ from gppylib.db import dbconn
 from gppylib.db.dbconn import execSQL
 from gppylib.gparray import GpArray
 from pygresql import pg
+from gppylib.operations.utils import DEFAULT_NUM_WORKERS
+import gzip
 
 logger = gplog.get_default_logger()
 
@@ -35,19 +38,19 @@ def get_all_parent_tables(dbname):
     return set([d[0] for d in data])
 
 def list_to_quoted_string(filter_tables):
-    filter_string = "'" + "', '".join([t.strip() for t in filter_tables]) + "'"
+    filter_string = "'" + "', '".join([pg.escape_string(t) for t in filter_tables]) + "'"
     return filter_string
 
 def convert_parents_to_leafs(dbname, parents):
     partition_leaves_sql = """
-                           SELECT x.partitionschemaname || '.' || x.partitiontablename 
+                           SELECT x.partitionschemaname || '.' || x.partitiontablename
                            FROM (
-                                SELECT distinct schemaname, tablename, partitionschemaname, partitiontablename, partitionlevel 
-                                FROM pg_partitions 
+                                SELECT distinct schemaname, tablename, partitionschemaname, partitiontablename, partitionlevel
+                                FROM pg_partitions
                                 WHERE schemaname || '.' || tablename in (%s)
-                                ) as X, 
-                           (SELECT schemaname, tablename maxtable, max(partitionlevel) maxlevel 
-                            FROM pg_partitions 
+                                ) as X,
+                           (SELECT schemaname, tablename maxtable, max(partitionlevel) maxlevel
+                            FROM pg_partitions
                             group by (tablename, schemaname)
                            ) as Y
                            WHERE x.schemaname = y.schemaname and x.tablename = Y.maxtable and x.partitionlevel = Y.maxlevel;
@@ -66,8 +69,8 @@ def convert_parents_to_leafs(dbname, parents):
 #output: same list but parent tables converted to leafs
 def expand_partition_tables(dbname, filter_tables):
 
-    if filter_tables is None:
-        return None
+    if not filter_tables or len(filter_tables) == 0:
+        return filter_tables
     parent_tables = list()
     non_parent_tables = list()
     expanded_list = list()
@@ -95,12 +98,16 @@ def get_batch_from_list(length, batch_size):
     return indices
 
 def create_temp_file_from_list(entries, prefix):
-    if entries is None:
+    """
+    When writing the entries into temp file, don't do any strip as there might be
+    white space in schema name and table name.
+    """
+    if len(entries) == 0:
         return None
 
     fd = tempfile.NamedTemporaryFile(mode='w', prefix=prefix, delete=False)
     for entry in entries:
-        fd.write(entry.rstrip() + '\n')
+        fd.write(entry + '\n')
     tmp_file_name = fd.name
     fd.close()
 
@@ -110,6 +117,9 @@ def create_temp_file_from_list(entries, prefix):
 
 def create_temp_file_with_tables(table_list):
     return create_temp_file_from_list(table_list, 'table_list_')
+
+def create_temp_file_with_schemas(schema_list):
+    return create_temp_file_from_list(schema_list, 'schema_file_')
 
 def validate_timestamp(timestamp):
     if not timestamp:
@@ -159,45 +169,96 @@ def convert_reportfilename_to_cdatabasefilename(report_file, dump_prefix, ddboos
         dirname = "%s/%s" % (dirname, timestamp[0:8])
     return "%s/%sgp_cdatabase_1_1_%s" % (dirname, dump_prefix, timestamp)
 
-def get_lines_from_dd_file(filename):
-    cmd = Command('DDBoost copy of master dump file',
-                  'gpddboost --readFile --from-file=%s'
-                  % (filename))
+def get_lines_from_dd_file(filename, ddboost_storage_unit):
+    cmdStr = 'gpddboost --readFile --from-file=%s' % filename
+    if ddboost_storage_unit:
+        cmdStr += ' --ddboost-storage-unit=%s' % ddboost_storage_unit
+
+    cmd = Command('DDBoost copy of master dump file', cmdStr)
 
     cmd.run(validateAfter=True)
     contents = cmd.get_results().stdout.splitlines()
     return contents
 
-def check_cdatabase_exists(dbname, report_file, dump_prefix, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
+def check_cdatabase_exists(dbname, report_file, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None, netbackup_block_size=None):
     try:
         filename = convert_reportfilename_to_cdatabasefilename(report_file, dump_prefix, ddboost)
     except Exception:
         return False
 
     if ddboost:
-        cdatabase_contents = get_lines_from_dd_file(filename)
+        cdatabase_contents = get_lines_from_dd_file(filename, ddboost_storage_unit)
     elif netbackup_service_host:
         restore_file_with_nbu(netbackup_service_host, netbackup_block_size, filename)
         cdatabase_contents = get_lines_from_file(filename)
     else:
-        cdatabase_contents = get_lines_from_file(filename, ddboost)
+        cdatabase_contents = get_lines_from_file(filename)
 
+    dbname = escapeDoubleQuoteInSQLString(dbname, forceDoubleQuote=False)
     for line in cdatabase_contents:
         if 'CREATE DATABASE' in line:
-            parts = line.split()
-            if len(parts) < 3:
+            dump_dbname = get_dbname_from_cdatabaseline(line)
+            if dump_dbname is None:
                 continue
-            if parts[2] is not None and dbname == parts[2].strip('"'):
-                return True
+            else:
+                if dbname == checkAndRemoveEnclosingDoubleQuote(dump_dbname):
+                    return True
     return False
 
-def get_type_ts_from_report_file(dbname, report_file, backup_type, dump_prefix, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
+def get_dbname_from_cdatabaseline(line):
+    """
+    Line format: CREATE DATABASE "DBNAME" WITH TEMPLATE = template0 ENCODING = 'UTF8' OWNER = gpadmin;
+
+    To get the dbname:
+    substring between the ending index of the first statement: CREATE DATABASE and the starting index
+    of WITH TEMPLATE whichever is not inside any double quotes, based on the fact that double quote
+    inside any name will be escaped by extra double quote, so there's always only one WITH TEMPLATE not
+    inside any doubles, means its previous and post string should have only even number of double
+    quotes.
+    Note: OWER name can also have special characters with double quote.
+    """
+    cdatabase = "CREATE DATABASE "
+    try:
+        start = line.index(cdatabase)
+    except Exception as e:
+        logger.error('Failed to find substring %s in line %s, error: %s' % (cdatabase, line, str(e)))
+        return None
+
+    keyword = " WITH TEMPLATE = "
+    pos = get_nonquoted_keyword_index(line, keyword, '"', len(keyword))
+    if pos != -1:
+        dbname = line[start+len(cdatabase) : pos]
+        return dbname
+    return None
+
+def get_nonquoted_keyword_index(line, keyword, quote, keyword_len):
+    # quote can be single quote or double quote
+    all_positions = get_all_occurrences(keyword, line)
+    if all_positions != None and len(all_positions) > 0:
+        for pos in all_positions:
+            pre_string = line[:pos]
+            post_string = line[pos + keyword_len:]
+            quotes_before = get_all_occurrences('%s' % quote, pre_string)
+            quotes_after = get_all_occurrences('%s' % quote, post_string)
+            num_quotes_before = 0 if (quotes_before is None or len(quotes_before) == 0) else len(quotes_before)
+            num_quotes_after = 0 if (quotes_after is None or len(quotes_after) == 0) else len(quotes_after)
+            if num_quotes_before % 2 == 0 and num_quotes_after % 2 == 0:
+                return pos
+    return -1
+
+def get_all_occurrences(substr, line):
+    # substr is used for generating the pattern, escape those special chars in regexp
+    if substr is None or line is None or len(substr) > len(line):
+        return None
+    return [m.start() for m in re.finditer('(?=%s)' % substr, line)]
+
+def get_type_ts_from_report_file(dbname, report_file, backup_type, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None, netbackup_block_size=None):
     report_file_contents = get_lines_from_file(report_file)
 
     if not check_successful_dump(report_file_contents):
         return None
 
-    if not check_cdatabase_exists(dbname, report_file, dump_prefix, ddboost, netbackup_service_host, netbackup_block_size):
+    if not check_cdatabase_exists(dbname, report_file, dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size):
         return None
 
     if check_backup_type(report_file_contents, backup_type):
@@ -205,11 +266,11 @@ def get_type_ts_from_report_file(dbname, report_file, backup_type, dump_prefix, 
 
     return None
 
-def get_full_ts_from_report_file(dbname, report_file, dump_prefix, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
-    return get_type_ts_from_report_file(dbname, report_file, 'Full', dump_prefix, ddboost, netbackup_service_host, netbackup_block_size)
+def get_full_ts_from_report_file(dbname, report_file, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None, netbackup_block_size=None):
+    return get_type_ts_from_report_file(dbname, report_file, 'Full', dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size)
 
-def get_incremental_ts_from_report_file(dbname, report_file, dump_prefix, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
-    return get_type_ts_from_report_file(dbname, report_file, 'Incremental', dump_prefix, ddboost, netbackup_service_host, netbackup_block_size)
+def get_incremental_ts_from_report_file(dbname, report_file, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None, netbackup_block_size=None):
+    return get_type_ts_from_report_file(dbname, report_file, 'Incremental', dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size)
 
 def get_timestamp_val(report_file_contents):
     for line in report_file_contents:
@@ -228,26 +289,52 @@ def check_backup_type(report_file_contents, backup_type):
                 return True
     return False
 
-def get_lines_from_file(fname, ddboost=None):
+def get_lines_from_zipped_file(fname):
+    """
+    Don't strip white space here as it may be part of schema name and table name
+    """
+    content = []
+    fd = gzip.open(fname, 'r')
+    try:
+        for line in fd:
+            content.append(line.strip('\n'))
+    except err:
+        raise Exception("Error reading from file %s: %s" % (fname, err))
+    finally:
+        fd.close()
+    return content
+
+def get_lines_from_file(fname, ddboost=None, ddboost_storage_unit=None):
+    """
+    Don't strip white space here as it may be part of schema name and table name
+    """
     content = []
     if ddboost:
-        contents = get_lines_from_dd_file(fname)
+        contents = get_lines_from_dd_file(fname, ddboost_storage_unit)
         return contents
     else:
         with open(fname) as fd:
             for line in fd:
-                content.append(line.rstrip())
+                content.append(line.strip('\n'))
         return content
 
 def write_lines_to_file(filename, lines):
+    """
+    Don't do strip in line for white space in case it is part of schema name or table name
+    """
+
     with open(filename, 'w') as fp:
         for line in lines:
-            fp.write("%s\n" % line.rstrip())
+            fp.write("%s\n" % line.strip('\n'))
 
 def verify_lines_in_file(fname, expected):
     lines = get_lines_from_file(fname)
+
     if lines != expected:
-        raise Exception("After writing file '%s' contents not as expected, suspected IO error" % fname)
+        raise Exception("After writing file '%s' contents not as expected.\n"
+                        "Lines read from file %s\n"
+                        "Lines expected from file %s\n"
+                        "Suspected IO error" % (fname, lines, expected))
 
 def check_dir_writable(directory):
     fp = None
@@ -379,6 +466,9 @@ def generate_dbdump_prefix(dump_prefix):
 def generate_createdb_prefix(dump_prefix):
     return '%sgp_cdatabase_1_1_' % (dump_prefix)
 
+def generate_stats_prefix(dump_prefix):
+    return '%sgp_statistics_1_1_' % (dump_prefix)
+
 def generate_createdb_filename(master_data_dir, backup_dir, dump_dir, dump_prefix, timestamp, ddboost=False):
     if ddboost:
         return '%s/%s/%s/%s%s' % (master_data_dir, dump_dir, timestamp[0:8], generate_createdb_prefix(dump_prefix), timestamp)
@@ -437,20 +527,33 @@ def get_timestamp_from_increments_filename(filename, dump_prefix):
         raise Exception("Invalid increments file '%s' passed to get_timestamp_from_increments_filename" % filename)
     return parts[-2].strip()
 
-def get_full_timestamp_for_incremental(backup_dir, dump_dir, dump_prefix, incremental_timestamp):
-    pattern = '%s/%s/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/%sgp_dump_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_increments' % (backup_dir, dump_dir, dump_prefix)
-    increments_files = glob.glob(pattern)
+def get_full_timestamp_for_incremental(master_datadir, dump_dir, dump_prefix, incremental_timestamp, backup_dir=None, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
+    full_timestamp = None
+    if netbackup_service_host:
+        full_timestamp = get_full_timestamp_for_incremental_with_nbu(dump_prefix, incremental_timestamp, netbackup_service_host, netbackup_block_size)
+    else:
+        if ddboost:
+            backup_dir = master_datadir
+        else:
+            backup_dir = get_restore_dir(master_datadir, backup_dir)
 
-    for increments_file in increments_files:
-        increment_ts = get_lines_from_file(increments_file)
-        if incremental_timestamp in increment_ts:
-            full_timestamp = get_timestamp_from_increments_filename(increments_file, dump_prefix)
-            return full_timestamp
+        pattern = '%s/%s/[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]/%sgp_dump_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_increments' % (backup_dir, dump_dir, dump_prefix)
+        increments_files = glob.glob(pattern)
 
-    return None
+        for increments_file in increments_files:
+            increment_ts = get_lines_from_file(increments_file)
+            if incremental_timestamp in increment_ts:
+                full_timestamp = get_timestamp_from_increments_filename(increments_file, dump_prefix)
+                break
+
+    if not full_timestamp:
+        raise Exception("Could not locate fullbackup associated with timestamp '%s'. Either increments file or full backup is missing." % incremental_timestamp)
+
+    return full_timestamp
+
 
 # backup_dir will be either MDD or some other directory depending on call
-def get_latest_full_dump_timestamp(dbname, backup_dir, dump_dir, dump_prefix, ddboost=False):
+def get_latest_full_dump_timestamp(dbname, backup_dir, dump_dir, dump_prefix, ddboost=False, ddboost_storage_unit=None):
     if not backup_dir:
         raise Exception('Invalid None param to get_latest_full_dump_timestamp')
 
@@ -472,7 +575,7 @@ def get_latest_full_dump_timestamp(dbname, backup_dir, dump_dir, dump_prefix, dd
         dump_report_files = sorted(dump_report_files, key=lambda x: int(x.split('_')[-1].split('.')[0]), reverse=True)
         for dump_report_file in dump_report_files:
             logger.debug('Checking for latest timestamp in report file %s' % os.path.join(dump_dir, dump_report_file))
-            timestamp = get_full_ts_from_report_file(dbname, os.path.join(dump_dir, dump_report_file), dump_prefix, ddboost)
+            timestamp = get_full_ts_from_report_file(dbname, os.path.join(dump_dir, dump_report_file), dump_prefix, ddboost, ddboost_storage_unit)
             logger.debug('Timestamp = %s' % timestamp)
             if timestamp is not None:
                 return timestamp
@@ -496,12 +599,6 @@ def scp_file_to_hosts(host_list, filename, batch_default):
     pool.haltWork()
     pool.check_results()
 
-def remove_file_from_segments(master_port, filename):
-    hostlist = get_all_segment_addresses(master_port)
-    for hname in hostlist:
-        cmd = Command('Remove tmp files', 'rm -f %s' % filename, ctxt=REMOTE, remoteHost=hname)
-        cmd.run(validateAfter=True)
-
 def run_pool_command(host_list, cmd_str, batch_default, check_results=True):
     pool = WorkerPool(numWorkers=min(len(host_list), batch_default))
 
@@ -514,10 +611,19 @@ def run_pool_command(host_list, cmd_str, batch_default, check_results=True):
     if check_results:
         pool.check_results()
 
-def check_funny_chars_in_tablenames(tablenames):
-    for tablename in tablenames:
-        if '\n' in tablename or ',' in tablename or ':' in tablename:
-            raise Exception('Tablename has an invalid character "\\n", ":", "," : "%s"' % tablename)
+def check_funny_chars_in_names(names, is_full_qualified_name=True):
+    """
+    '\n' inside table name makes it hard to specify the object name in shell command line,
+    this may be worked around by using table file, but currently we read input line by line.
+    '!' inside table name will mess up with the shell history expansion.
+    ',' is used for separating tables in plan file during incremental restore.
+    '.' dot is currently being used for full qualified table name in format: schema.table
+    """
+    if names and len(names) > 0:
+        for name in names:
+            if ('\t' in name or '\n' in name or '!' in name or ',' in name or
+               (is_full_qualified_name and name.count('.') > 1) or (not is_full_qualified_name and name.count('.') > 0)):
+                raise Exception('Name has an invalid character "\\t" "\\n" "!" "," ".": "%s"' % name)
 
 #Form and run command line to backup individual file with NBU
 def backup_file_with_nbu(netbackup_service_host, netbackup_policy, netbackup_schedule, netbackup_block_size, netbackup_keyword, netbackup_filepath, hostname=None):
@@ -569,6 +675,14 @@ def generate_global_filename(master_data_dir, backup_dir, dump_dir, dump_prefix,
 def generate_cdatabase_filename(master_data_dir, backup_dir, dump_dir, dump_prefix, timestamp):
     use_dir = get_backup_directory(master_data_dir, backup_dir, dump_dir, timestamp)
     return "%s/%sgp_cdatabase_1_1_%s" % (use_dir, dump_prefix, timestamp)
+
+def generate_stats_filename(master_data_dir, backup_dir, dump_dir, dump_prefix, dump_date, timestamp):
+    if backup_dir is not None:
+        dir_path = backup_dir
+    else:
+        dir_path = master_data_dir
+
+    return os.path.join(dir_path, dump_dir, dump_date, "%s%s" % (generate_stats_prefix(dump_prefix), timestamp))
 
 def get_full_timestamp_for_incremental_with_nbu(dump_prefix, incremental_timestamp, netbackup_service_host, netbackup_block_size):
     if dump_prefix:
@@ -628,3 +742,146 @@ def check_schema_exists(schema_name, dbname):
     if len(getRows(dbname, schema_check_sql)) < 1:
         return False
     return True
+
+def unescape_string(string):
+    if string:
+        string = string.replace('\\\\', '\\').replace("''", "'")
+    return string
+
+def isDoubleQuoted(string):
+    if len(string) > 2 and string[0] == '"' and string[-1] == '"':
+        return True
+    return False
+
+def checkAndRemoveEnclosingDoubleQuote(string):
+    if isDoubleQuoted(string):
+        string = string[1 : len(string) - 1]
+    return string
+
+def checkAndAddEnclosingDoubleQuote(string):
+    if not isDoubleQuoted(string):
+        string = '"' + string + '"'
+    return string
+
+def escapeDoubleQuoteInSQLString(string, forceDoubleQuote=True):
+    """
+    Accept true database name, schema name, table name, escape the double quote
+    inside the name, add enclosing double quote by default.
+    """
+    string = string.replace('"', '""')
+
+    if forceDoubleQuote:
+        string = '"' + string + '"'
+    return string
+
+def removeEscapingDoubleQuoteInSQLString(string, forceDoubleQuote=True):
+    """
+    Remove the escaping double quote in database/schema/table name.
+    """
+    if string is None:
+        return string
+
+    string = string.replace('""', '"')
+
+    if forceDoubleQuote:
+        string = '"' + string + '"'
+    return string
+
+def formatSQLString(rel_file, isTableName=False):
+    """
+    Read the full qualified schema or table name, do a split
+    if each item is a table name into schema and table,
+    escape the double quote inside the name properly.
+    """
+    relnames = []
+    if rel_file and os.path.exists(rel_file):
+        with open(rel_file, 'r') as fr:
+            lines = fr.read().strip('\n').split('\n')
+            for line in lines:
+                if isTableName:
+                    schema, table = split_fqn(line)
+                    schema = escapeDoubleQuoteInSQLString(schema)
+                    table = escapeDoubleQuoteInSQLString(table)
+                    relnames.append(schema + '.' + table)
+                else:
+                    schema = escapeDoubleQuoteInSQLString(line)
+                    relnames.append(schema)
+        if len(relnames) > 0:
+            tmp_file = create_temp_file_from_list(relnames, os.path.basename(rel_file))
+            return tmp_file
+
+def split_fqn(fqn_name):
+    """
+    Split full qualified table name into schema and table by separator '.',
+    """
+    try:
+        schema, table = fqn_name.split('.')
+    except Exception as e:
+        logger.error("Failed to split name %s into schema and table, please check the format is schema.table" % fqn_name)
+        raise Exception('%s' % str(e))
+    return schema, table
+
+def remove_file_on_segments(master_port, filename, batch_default=DEFAULT_NUM_WORKERS):
+    addresses = get_all_segment_addresses(master_port)
+
+    try:
+        cmd = 'rm -f %s' % filename
+        run_pool_command(addresses, cmd, batch_default, check_results=False)
+    except Exception as e:
+        logger.error("cleaning up file failed: %s" % e.__str__())
+
+def get_restore_dir(data_dir, backup_dir):
+    if backup_dir is not None:
+        return backup_dir
+    else:
+        return data_dir
+
+def get_table_info(line):
+    """
+    It's complex to split when table name/schema name/user name/ tablespace name
+    contains full context of one of others', which is very unlikely, but in
+    case it happens, return None.
+
+    Since we only care about table name, type, and schema name, strip the input
+    is safe here.
+
+    line: contains the true (un-escaped) schema name, table name, and user name.
+    """
+
+
+    COMMENT_EXPR = '-- Name: '
+    TYPE_EXPR = '; Type: '
+    SCHEMA_EXPR = '; Schema: '
+    OWNER_EXPR = '; Owner: '
+    TABLESPACE_EXPR = '; Tablespace: '
+
+    temp = line.strip('\n')
+    type_start = get_all_occurrences(TYPE_EXPR, temp)
+    schema_start = get_all_occurrences(SCHEMA_EXPR, temp)
+    owner_start = get_all_occurrences(OWNER_EXPR, temp)
+    tblspace_start = get_all_occurrences(TABLESPACE_EXPR, temp)
+    if len(type_start) != 1 or len(schema_start) != 1 or len(owner_start) != 1:
+        return (None, None, None, None)
+    name = temp[len(COMMENT_EXPR) : type_start[0]]
+    type = temp[type_start[0] + len(TYPE_EXPR) : schema_start[0]]
+    schema = temp[schema_start[0] + len(SCHEMA_EXPR) : owner_start[0]]
+    if not tblspace_start:
+        tblspace_start.append(None)
+    owner = temp[owner_start[0] + len(OWNER_EXPR) : tblspace_start[0]]
+    return (name, type, schema, owner)
+
+def get_master_dump_file(master_datadir, backup_dir, dump_dir, timestamp, dump_prefix, ddboost):
+    """
+    Generate the path to master dump file for ddboost, local cluster and netbackup dump, this function
+    does not generate path to other remote dump location.
+    Currently the netbackup and local dump both have same backup directory.
+
+    DDboost is different from netbackup & local dump
+    """
+    dump_file_name = "%s%s" % (generate_master_dbdump_prefix(dump_prefix), timestamp)
+
+    if ddboost:
+        dump_file = os.path.join(dump_dir, timestamp[0:8], dump_file_name)
+    else:
+        dump_file = os.path.join(get_restore_dir(master_datadir, backup_dir), dump_dir, timestamp[0:8], dump_file_name)
+    return dump_file

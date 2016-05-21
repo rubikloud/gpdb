@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/parser/parse_target.c,v 1.152 2007/01/05 22:19:34 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/parser/parse_target.c,v 1.154 2007/02/03 14:06:54 petere Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -1385,7 +1385,7 @@ FigureColnameInternal(Node *node, char **name)
 				return 1;
 			}
 			break;
-		case T_ArrayExpr:
+		case T_A_ArrayExpr:
 			/* make ARRAY[] act like a function */
 			*name = "array";
 			return 2;

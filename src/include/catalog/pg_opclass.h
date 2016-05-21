@@ -28,7 +28,7 @@
  * Portions Copyright (c) 1996-2008, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_opclass.h,v 1.73 2007/01/05 22:19:52 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/catalog/pg_opclass.h,v 1.74 2007/01/28 16:16:52 neilc Exp $
  *
  * NOTES
  *	  the genbki.sh script reads this file and generates .bki
@@ -139,9 +139,9 @@ DATA(insert (	405		int2_ops			PGNSP PGUID 1977   21 t 0 ));
 DATA(insert OID = 1978 ( 403	int4_ops	PGNSP PGUID 1976   23 t 0 ));
 #define INT4_BTREE_OPS_OID 1978
 DATA(insert (	405		int4_ops			PGNSP PGUID 1977   23 t 0 ));
-DATA(insert (	403		int8_ops			PGNSP PGUID 1976   20 t 0 ));
+DATA(insert OID = 1980 ( 403	int8_ops	PGNSP PGUID 1976   20 t 0 ));
 #define INT8_BTREE_OPS_OID 1980
-DATA(insert OID = 1980 ( 405	int8_ops	PGNSP PGUID 1977   20 t 0 ));
+DATA(insert (	405		int8_ops			PGNSP PGUID 1977   20 t 0 ));
 DATA(insert (	403		interval_ops		PGNSP PGUID 1982 1186 t 0 ));
 DATA(insert (	405		interval_ops		PGNSP PGUID 1983 1186 t 0 ));
 DATA(insert (	403		macaddr_ops			PGNSP PGUID 1984  829 t 0 ));
@@ -150,6 +150,7 @@ DATA(insert (	403		name_ops			PGNSP PGUID 1986   19 t 0 ));
 DATA(insert (	405		name_ops			PGNSP PGUID 1987   19 t 0 ));
 DATA(insert (	403		numeric_ops			PGNSP PGUID 1988 1700 t 0 ));
 DATA(insert (	405		numeric_ops			PGNSP PGUID 1998 1700 t 0 ));
+DATA(insert (	403		complex_ops			PGNSP PGUID 3221 195 t 0 ));
 DATA(insert OID = 1981 ( 403	oid_ops		PGNSP PGUID 1989   26 t 0 ));
 #define OID_BTREE_OPS_OID 1981
 DATA(insert (	405		oid_ops				PGNSP PGUID 1990   26 t 0 ));
@@ -210,6 +211,7 @@ DATA(insert (	2742	_interval_ops		PGNSP PGUID 2745  1187 t 1186 ));
 DATA(insert (	2742	_macaddr_ops		PGNSP PGUID 2745  1040 t 829 ));
 DATA(insert (	2742	_name_ops			PGNSP PGUID 2745  1003 t 19 ));
 DATA(insert (	2742	_numeric_ops		PGNSP PGUID 2745  1231 t 1700 ));
+DATA(insert (	2742	_complex_ops		PGNSP PGUID 2745  196 t 1700 ));
 DATA(insert (	2742	_oid_ops			PGNSP PGUID 2745  1028 t 26 ));
 DATA(insert (	2742	_oidvector_ops		PGNSP PGUID 2745  1013 t 30 ));
 DATA(insert (	2742	_time_ops			PGNSP PGUID 2745  1183 t 1083 ));
@@ -221,6 +223,8 @@ DATA(insert (	2742	_timestamp_ops		PGNSP PGUID 2745  1115 t 1114 ));
 DATA(insert (	2742	_money_ops			PGNSP PGUID 2745  791 t 790 ));
 DATA(insert (	2742	_reltime_ops		PGNSP PGUID 2745  1024 t 703 ));
 DATA(insert (	2742	_tinterval_ops		PGNSP PGUID 2745  1025 t 704 ));
+DATA(insert (   403     uuid_ops			PGNSP PGUID 2968  2950 t 0 ));
+DATA(insert (   405     uuid_ops			PGNSP PGUID 2969  2950 t 0 ));
 
 DATA(insert (	403		xlogloc_ops			PGNSP PGUID 7080  3310 t 0 ));
 

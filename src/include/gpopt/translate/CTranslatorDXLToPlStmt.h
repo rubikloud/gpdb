@@ -607,7 +607,6 @@ namespace gpdxl
 				(
 				const CDXLTableDescr *pdxltabdesc,
 				const CDXLIndexDescr *pdxlid,
-				ULONG ulRelColumns,
 				Index iRel,
 				CDXLTranslateContextBaseTable *pdxltrctxbtOut
 				);
@@ -720,7 +719,8 @@ namespace gpdxl
 				const CDXLNode *pdxlnSortColList,
 				const CDXLTranslateContext *pdxltrctxChild,
 				AttrNumber *pattnoSortColIds,
-				Oid *poidSortOpIds
+				Oid *poidSortOpIds,
+				bool *pboolNullsFirst
 				);
 
 			List *PlQualFromScalarCondNode

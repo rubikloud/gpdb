@@ -862,7 +862,7 @@ spin_delay(void)
 
 /* Blow up if we didn't have any way to do spinlocks */
 #ifndef HAS_TEST_AND_SET
-#error PostgreSQL does not have native spinlock support on this platform.  To continue the compilation, rerun configure using --disable-spinlocks.  However, performance will be poor.  Please report this to pgsql-bugs@postgresql.org.
+#error Greenplum does not have native spinlock support on this platform.  To continue the compilation, rerun configure using --disable-spinlocks.  However, performance will be poor.  Please report this to bugs@greenplum.org.
 #endif
 
 
@@ -925,6 +925,7 @@ extern int	tas(volatile slock_t *lock);		/* in port/.../tas.s, or
 #define TAS(lock)		tas(lock)
 #endif	 /* TAS */
 
+extern slock_t dummy_spinlock;
 
 /*
  * Platform-independent out-of-line support routines

@@ -130,6 +130,8 @@
 #include "utils/debugbreak.h"
 #include "pg_trace.h"
 
+#include "codegen/codegen_wrapper.h"
+
 #ifdef CDB_TRACE_EXECUTOR
 #include "nodes/print.h"
 static void ExecCdbTraceNode(PlanState *node, bool entry, TupleTableSlot *result);
@@ -220,6 +222,13 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	int origExecutingSliceId = estate->currentExecutingSliceId;
 
 	MemoryAccount* curMemoryAccount = NULL;
+
+	StringInfo codegenManagerName = makeStringInfo();
+	appendStringInfo(codegenManagerName, "%s-%d-%d", "execProcnode", node->plan_node_id, node->type);
+	void* CodegenManager = CodeGeneratorManagerCreate(codegenManagerName->data);
+	START_CODE_GENERATOR_MANAGER(CodegenManager);
+	{
+
 
 	/*
 	 * Is current plan node supposed to execute in current slice?
@@ -745,7 +754,13 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 	if (result != NULL)
 	{
 		SAVE_EXECUTOR_MEMORY_ACCOUNT(result, curMemoryAccount);
+		result->CodegenManager = CodegenManager;
+		CodeGeneratorManagerGenerateCode(CodegenManager);
+		CodeGeneratorManagerPrepareGeneratedFunctions(CodegenManager);
 	}
+	}
+	END_CODE_GENERATOR_MANAGER();
+
 	return result;
 }
 
@@ -802,6 +817,8 @@ ExecProcNode(PlanState *node)
 {
 	TupleTableSlot *result = NULL;
 
+	START_CODE_GENERATOR_MANAGER(node->CodegenManager);
+	{
 	START_MEMORY_ACCOUNT(node->plan->memoryAccount);
 	{
 
@@ -1221,6 +1238,8 @@ Exec_Jmp_Done:
 
 	}
 	END_MEMORY_ACCOUNT();
+	}
+	END_CODE_GENERATOR_MANAGER();
 	return result;
 }
 
@@ -1738,6 +1757,13 @@ ExecEndNode(PlanState *node)
 			elog(ERROR, "unrecognized node type: %d", (int) nodeTag(node));
 			break;
 	}
+
+	/*
+	 * if codegen guc is true, then assert if CodegenManager is NULL
+	 */
+	AssertImply(codegen, NULL != node->CodegenManager);
+	CodeGeneratorManagerDestroy(node->CodegenManager);
+	node->CodegenManager = NULL;
 
 	estate->currentSliceIdInPlan = origSliceIdInPlan;
 	estate->currentExecutingSliceId = origExecutingSliceId;

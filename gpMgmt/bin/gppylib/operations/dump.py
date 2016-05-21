@@ -1,7 +1,11 @@
 import os
+import sys
 import shutil
 import tempfile
+from pygresql import pg
 from datetime import datetime
+from time import sleep
+from pygresql import pg
 from gppylib import gplog
 from gppylib.commands.base import Command, REMOTE, ExecutionError
 from gppylib.commands.gp import Psql
@@ -10,17 +14,20 @@ from gppylib.db import dbconn
 from gppylib.db.dbconn import execSQL, execSQLForSingleton
 from gppylib.gparray import GpArray
 from gppylib.mainUtils import ExceptionNoStackTraceNeeded
+from gppylib.utils import shellEscape
 from gppylib.operations import Operation
 from gppylib.operations.unix import CheckDir, CheckFile, ListFiles, ListFilesByPattern, MakeDir, RemoveFile, RemoveTree, RemoveRemoteTree
 from gppylib.operations.utils import RemoteOperation, ParallelOperation
 from gppylib.operations.backup_utils import backup_file_with_nbu, check_file_dumped_with_nbu, create_temp_file_from_list, execute_sql, \
                                             generate_ao_state_filename, generate_cdatabase_filename, generate_co_state_filename, generate_dirtytable_filename, \
                                             generate_filter_filename, generate_global_filename, generate_global_prefix, generate_increments_filename, \
-                                            generate_master_config_filename, generate_master_dbdump_prefix, generate_master_status_prefix, generate_partition_list_filename, \
+                                            generate_master_config_filename, generate_master_dbdump_prefix, generate_master_status_prefix, \
+                                            generate_partition_list_filename, generate_stats_filename, \
                                             generate_pgstatlastoperation_filename, generate_report_filename, generate_schema_filename, generate_seg_dbdump_prefix, \
                                             generate_seg_status_prefix, generate_segment_config_filename, get_incremental_ts_from_report_file, \
                                             get_latest_full_dump_timestamp, get_latest_full_ts_with_nbu, get_latest_report_timestamp, get_lines_from_file, \
-                                            restore_file_with_nbu, validate_timestamp, verify_lines_in_file, write_lines_to_file
+                                            restore_file_with_nbu, validate_timestamp, verify_lines_in_file, write_lines_to_file, isDoubleQuoted, formatSQLString, \
+                                            checkAndAddEnclosingDoubleQuote, split_fqn, remove_file_on_segments, generate_stats_prefix
 
 logger = gplog.get_default_logger()
 
@@ -105,38 +112,45 @@ GET_LAST_OPERATION_SQL = """
 GET_ALL_SCHEMAS_SQL = "SELECT nspname from pg_namespace;"
 
 def get_include_schema_list_from_exclude_schema(exclude_schema_list, catalog_schema_list, master_port, dbname):
+    """
+    If schema name is already double quoted, remove it so comparing with
+    schemas returned by database will be correct.
+    Don't do strip, that will remove white space inside schema name
+    """
     include_schema_list = []
     schema_list = execute_sql(GET_ALL_SCHEMAS_SQL, master_port, dbname)
     for schema in schema_list:
-        if schema[0].strip() not in exclude_schema_list and schema[0].strip() not in catalog_schema_list:
+        if schema[0] not in exclude_schema_list and schema[0] not in catalog_schema_list:
             include_schema_list.append(schema[0])
 
     return include_schema_list
 
-def backup_schema_file_with_ddboost(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key=None):
+def backup_schema_file_with_ddboost(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key=None, ddboost_storage_unit=None):
     if timestamp_key is None:
         timestamp_key = TIMESTAMP_KEY
 
     filename = generate_schema_filename(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key, True)
-    copy_file_to_dd(filename, dump_dir, timestamp_key)
+    copy_file_to_dd(filename, dump_dir, timestamp_key, ddboost_storage_unit=ddboost_storage_unit)
 
-def backup_report_file_with_ddboost(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key=None):
+def backup_report_file_with_ddboost(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key=None, ddboost_storage_unit=None):
     if timestamp_key is None:
         timestamp_key = TIMESTAMP_KEY
 
     filename = generate_report_filename(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key, True)
-    copy_file_to_dd(filename, dump_dir, timestamp_key)
+    copy_file_to_dd(filename, dump_dir, timestamp_key, ddboost_storage_unit=ddboost_storage_unit)
 
-def backup_increments_file_with_ddboost(master_datadir, backup_dir, dump_dir, dump_prefix, full_timestamp):
+def backup_increments_file_with_ddboost(master_datadir, backup_dir, dump_dir, dump_prefix, full_timestamp, ddboost_storage_unit=None):
     filename = generate_increments_filename(master_datadir, backup_dir, dump_dir, dump_prefix, full_timestamp, True)
-    copy_file_to_dd(filename, dump_dir, full_timestamp)
+    copy_file_to_dd(filename, dump_dir, full_timestamp, ddboost_storage_unit=ddboost_storage_unit)
 
-def copy_file_to_dd(filename, dump_dir, timestamp_key=None):
+def copy_file_to_dd(filename, dump_dir, timestamp_key=None, ddboost_storage_unit=None):
     if timestamp_key is None:
         timestamp_key = TIMESTAMP_KEY
 
     basefilename = os.path.basename(filename)
     cmdStr = "gpddboost --copyToDDBoost --from-file=%s --to-file=%s/%s/%s" % (filename, dump_dir, timestamp_key[0:8], basefilename)
+    if ddboost_storage_unit:
+        cmdStr += " --ddboost-storage-unit=%s" % ddboost_storage_unit
     cmd = Command('copy file %s to DD machine' % basefilename, cmdStr)
     cmd.run(validateAfter=True)
 
@@ -170,7 +184,7 @@ def validate_modcount(schema, tablename, cnt):
     if len(cnt) > 15:
         raise Exception("Exceeded backup max tuple count of 1 quadrillion rows per table for: '%s.%s' '%s'" % (schema, tablename, cnt))
 
-def get_partition_state(master_port, dbname, catalog_schema, partition_info):
+def get_partition_state_tuples(master_port, dbname, catalog_schema, partition_info):
     """
         Reads the partition state for an AO or AOCS relation, which is the sum of
         the modication counters over all ao segment files.
@@ -188,6 +202,9 @@ def get_partition_state(master_port, dbname, catalog_schema, partition_info):
         modcount by 1. Therefore it is save to assume that to relations with
         modcount 0 with the same last special operation do not have a logical
         change in them.
+
+        The result is a list of tuples, of the format:
+        (schema_schema, partition_name, modcount)
     """
     partition_list = list()
 
@@ -205,9 +222,20 @@ def get_partition_state(master_port, dbname, catalog_schema, partition_info):
             if modcount:
                 modcount = modcount.strip()
             validate_modcount(schemaname, partition_name, modcount)
-            partition_list.append('%s, %s, %s' %(schemaname, partition_name, modcount))
+            partition_list.append((schemaname, partition_name, modcount))
 
     return partition_list
+
+def get_partition_state(master_port, dbname, catalog_schema, partition_info):
+    """
+    A legacy version of get_partition_state_tuples() that returns a list of strings
+    instead of tuples. Should not be used in new code, because the string
+    representation doesn't handle schema or table names with commas.
+    """
+    tuples = get_partition_state_tuples(master_port, dbname, catalog_schema, partition_info)
+
+    # Don't put space after comma, which can mess up with the space in schema and table name
+    return map((lambda x: '%s,%s,%s' % x), tuples)
 
 def get_tables_with_dirty_metadata(master_datadir, backup_dir, dump_dir, dump_prefix, full_timestamp, cur_pgstatoperations,
                                    netbackup_service_host=None, netbackup_block_size=None):
@@ -288,7 +316,11 @@ def create_partition_dict(partition_list):
         fields = partition.split(',')
         if len(fields) != 3:
             raise Exception('Invalid state file format %s' % partition)
-        key = '%s.%s' % (fields[0].strip(), fields[1].strip())
+        # new version 4.3.8.0 retains and supports spaces in schema name: field[0] and table name: field[1]
+        # below to determine if previous state file was from an old version which uses comma and space separated "schema, table, modcount"
+        if fields[2].startswith(' '):
+            fields = [x.strip() for x in fields]
+        key = '%s.%s' % (fields[0], fields[1])
         table_dict[key] = fields[2].strip()
 
     return table_dict
@@ -313,14 +345,14 @@ def get_filename_from_filetype(table_type, master_datadir, backup_dir, dump_dir,
 
     return filename
 
-def write_state_file(table_type, master_datadir, backup_dir, dump_dir, dump_prefix, partition_list, ddboost=False):
+def write_state_file(table_type, master_datadir, backup_dir, dump_dir, dump_prefix, partition_list, ddboost=False, ddboost_storage_unit=None):
     filename = get_filename_from_filetype(table_type, master_datadir, backup_dir, dump_dir, dump_prefix, None, ddboost)
 
     write_lines_to_file(filename, partition_list)
     verify_lines_in_file(filename, partition_list)
 
     if ddboost:
-        copy_file_to_dd(filename, dump_dir)
+        copy_file_to_dd(filename, dump_dir, ddboost_storage_unit=ddboost_storage_unit)
 
 # return a list of dirty tables
 def get_dirty_tables(master_port, dbname, master_datadir, backup_dir, dump_dir, dump_prefix, fulldump_ts,
@@ -353,7 +385,7 @@ def get_dirty_heap_tables(master_port, dbname):
 def write_dirty_file_to_temp(dirty_tables):
     return create_temp_file_from_list(dirty_tables, 'dirty_backup_list_')
 
-def write_dirty_file(mdd, dirty_tables, backup_dir, dump_dir, dump_prefix, timestamp_key=None, ddboost=False):
+def write_dirty_file(mdd, dirty_tables, backup_dir, dump_dir, dump_prefix, timestamp_key=None, ddboost=False, ddboost_storage_unit=None):
     if timestamp_key is None:
         timestamp_key = TIMESTAMP_KEY
 
@@ -365,7 +397,7 @@ def write_dirty_file(mdd, dirty_tables, backup_dir, dump_dir, dump_prefix, times
 
     verify_lines_in_file(dirty_list_file, dirty_tables)
     if ddboost:
-        copy_file_to_dd(dirty_list_file, dump_dir)
+        copy_file_to_dd(dirty_list_file, dump_dir, ddboost_storage_unit=ddboost_storage_unit)
 
     return dirty_list_file
 
@@ -395,7 +427,7 @@ def get_user_table_list(master_port, dbname):
     return execute_sql(GET_ALL_USER_TABLES_SQL, master_port, dbname)
 
 def get_user_table_list_for_schema(master_port, dbname, schema):
-    sql = GET_ALL_USER_TABLES_FOR_SCHEMA_SQL % schema
+    sql = GET_ALL_USER_TABLES_FOR_SCHEMA_SQL % pg.escape_string(schema)
     return execute_sql(sql, master_port, dbname)
 
 def get_last_operation_data(master_port, dbname):
@@ -410,8 +442,8 @@ def get_last_operation_data(master_port, dbname):
     return data
 
 def write_partition_list_file(master_datadir, backup_dir, timestamp_key, master_port, dbname, dump_dir, dump_prefix,
-                              ddboost=False, netbackup_service_host=None):
-    filter_file = get_filter_file(dbname, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, netbackup_service_host)
+                              ddboost=False, netbackup_service_host=None, ddboost_storage_unit=None):
+    filter_file = get_filter_file(dbname, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host)
     partition_list_file_name = generate_partition_list_filename(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp_key)
 
     if filter_file:
@@ -429,9 +461,9 @@ def write_partition_list_file(master_datadir, backup_dir, timestamp_key, master_
         verify_lines_in_file(partition_list_file_name, partition_list)
 
     if ddboost:
-        copy_file_to_dd(partition_list_file_name, dump_dir)
+        copy_file_to_dd(partition_list_file_name, dump_dir, ddboost_storage_unit=ddboost_storage_unit)
 
-def write_last_operation_file(master_datadir, backup_dir, rows, dump_dir, dump_prefix, timestamp_key=None, ddboost=False):
+def write_last_operation_file(master_datadir, backup_dir, rows, dump_dir, dump_prefix, timestamp_key=None, ddboost=False, ddboost_storage_unit=None):
     if timestamp_key is None:
         timestamp_key = TIMESTAMP_KEY
 
@@ -440,7 +472,7 @@ def write_last_operation_file(master_datadir, backup_dir, rows, dump_dir, dump_p
     verify_lines_in_file(filename, rows)
 
     if ddboost:
-        copy_file_to_dd(filename, dump_dir)
+        copy_file_to_dd(filename, dump_dir, ddboost_storage_unit=ddboost_storage_unit)
 
 def validate_current_timestamp(backup_dir, dump_dir, dump_prefix, current=None):
     if current is None:
@@ -457,9 +489,9 @@ def get_backup_dir(master_datadir, backup_dir):
         return backup_dir
     return master_datadir
 
-def update_filter_file(dump_database, master_datadir, backup_dir, master_port, dump_dir, dump_prefix, ddboost=False, netbackup_service_host=None,
+def update_filter_file(dump_database, master_datadir, backup_dir, master_port, dump_dir, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None,
                        netbackup_policy=None, netbackup_schedule=None, netbackup_block_size=None, netbackup_keyword=None):
-    filter_filename = get_filter_file(dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, netbackup_service_host, netbackup_block_size)
+    filter_filename = get_filter_file(dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size)
     if netbackup_service_host:
         restore_file_with_nbu(netbackup_service_host, netbackup_block_size, filter_filename)
     filter_tables = get_lines_from_file(filter_filename)
@@ -476,9 +508,9 @@ def update_filter_file(dump_database, master_datadir, backup_dir, master_port, d
     if netbackup_service_host:
         backup_file_with_nbu(netbackup_service_host, netbackup_policy, netbackup_schedule, netbackup_block_size, netbackup_keyword, filter_filename)
 
-def get_filter_file(dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
+def get_filter_file(dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None, netbackup_block_size=None):
     if netbackup_service_host is None:
-        timestamp = get_latest_full_dump_timestamp(dump_database, get_backup_dir(master_datadir, backup_dir), dump_dir, dump_prefix, ddboost)
+        timestamp = get_latest_full_dump_timestamp(dump_database, get_backup_dir(master_datadir, backup_dir), dump_dir, dump_prefix, ddboost, ddboost_storage_unit)
     else:
         if FULL_DUMP_TS_WITH_NBU is None:
             timestamp = get_latest_full_ts_with_nbu(dump_database, get_backup_dir(master_datadir, backup_dir), dump_prefix, netbackup_service_host, netbackup_block_size)
@@ -509,10 +541,10 @@ def update_filter_file_with_dirty_list(filter_file, dirty_tables):
 
         write_lines_to_file(filter_file, filter_list)
 
-def filter_dirty_tables(dirty_tables, dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost=False,
+def filter_dirty_tables(dirty_tables, dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost=False, ddboost_storage_unit=None,
                         netbackup_service_host=None, netbackup_block_size=None):
     if netbackup_service_host is None:
-        timestamp = get_latest_full_dump_timestamp(dump_database, get_backup_dir(master_datadir, backup_dir), dump_dir, dump_prefix, ddboost)
+        timestamp = get_latest_full_dump_timestamp(dump_database, get_backup_dir(master_datadir, backup_dir), dump_dir, dump_prefix, ddboost, ddboost_storage_unit)
     else:
         if FULL_DUMP_TS_WITH_NBU is None:
             timestamp = get_latest_full_ts_with_nbu(dump_database, get_backup_dir(master_datadir, backup_dir), dump_prefix, netbackup_service_host, netbackup_block_size)
@@ -520,7 +552,7 @@ def filter_dirty_tables(dirty_tables, dump_database, master_datadir, backup_dir,
             timestamp = FULL_DUMP_TS_WITH_NBU
 
     schema_filename = generate_schema_filename(master_datadir, backup_dir, dump_dir, dump_prefix, timestamp, ddboost)
-    filter_file = get_filter_file(dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, netbackup_service_host, netbackup_block_size)
+    filter_file = get_filter_file(dump_database, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size)
     if filter_file:
         tables_to_filter = get_lines_from_file(filter_file)
         dirty_copy = dirty_tables[:]
@@ -528,7 +560,7 @@ def filter_dirty_tables(dirty_tables, dump_database, master_datadir, backup_dir,
             if table not in tables_to_filter:
                 if os.path.exists(schema_filename):
                     schemas_to_filter = get_lines_from_file(schema_filename)
-                    table_schema = table.split('.')[0].strip()
+                    table_schema = split_fqn(table)[0]
                     if table_schema not in schemas_to_filter:
                         dirty_tables.remove(table)
                 else:
@@ -603,6 +635,17 @@ def backup_global_file_with_nbu(master_datadir, backup_dir, dump_dir, dump_prefi
     backup_file_with_nbu(netbackup_service_host, netbackup_policy, netbackup_schedule, netbackup_block_size, netbackup_keyword,
                          generate_global_filename(master_datadir, backup_dir, dump_dir, dump_prefix, DUMP_DATE, timestamp_key))
 
+def backup_statistics_file_with_nbu(master_datadir, backup_dir, dump_dir, dump_prefix, netbackup_service_host, netbackup_policy, netbackup_schedule,
+                                    netbackup_block_size, netbackup_keyword, timestamp_key=None):
+    logger.debug("Inside backup_statistics_file_with_nbu\n")
+    if (master_datadir is None) and (backup_dir is None):
+        raise Exception('Master data directory and backup directory are both none.')
+    if timestamp_key is None:
+        timestamp_key = TIMESTAMP_KEY
+
+    backup_file_with_nbu(netbackup_service_host, netbackup_policy, netbackup_schedule, netbackup_block_size, netbackup_keyword,
+                         generate_stats_filename(master_datadir, backup_dir, dump_dir, dump_prefix, DUMP_DATE, timestamp_key))
+
 def backup_config_files_with_nbu(master_datadir, backup_dir, dump_dir, dump_prefix, master_port, netbackup_service_host, netbackup_policy,
                                  netbackup_schedule, netbackup_block_size, netbackup_keyword, timestamp_key=None):
     logger.debug("Inside backup_config_files_with_nbu\n")
@@ -671,13 +714,13 @@ class DumpDatabase(Operation):
                  exclude_dump_tables_file, backup_dir, free_space_percent, compress, clear_catalog_dumps, encoding,
                  output_options, batch_default, master_datadir, master_port, dump_dir, dump_prefix, ddboost,
                  netbackup_service_host, netbackup_policy, netbackup_schedule, netbackup_block_size, netbackup_keyword,
-                 incremental=False, include_schema_file=None):
+                 incremental=False, include_schema_file=None, ddboost_storage_unit=None):
         self.dump_database = dump_database
         self.dump_schema = dump_schema
         self.include_dump_tables = include_dump_tables
         self.exclude_dump_tables = exclude_dump_tables
-        self.include_dump_tables_file = include_dump_tables_file,
-        self.exclude_dump_tables_file = exclude_dump_tables_file,
+        self.include_dump_tables_file = include_dump_tables_file
+        self.exclude_dump_tables_file = exclude_dump_tables_file
         self.backup_dir = backup_dir
         self.free_space_percent = free_space_percent
         self.compress = compress
@@ -691,6 +734,7 @@ class DumpDatabase(Operation):
         self.dump_prefix = dump_prefix
         self.include_schema_file = include_schema_file
         self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
         self.incremental = incremental
         self.netbackup_service_host = netbackup_service_host
         self.netbackup_policy = netbackup_policy
@@ -703,8 +747,8 @@ class DumpDatabase(Operation):
                                                         dump_schema = self.dump_schema,
                                                         include_dump_tables = self.include_dump_tables,
                                                         exclude_dump_tables = self.exclude_dump_tables,
-                                                        include_dump_tables_file = self.include_dump_tables_file[0],
-                                                        exclude_dump_tables_file = self.exclude_dump_tables_file[0],
+                                                        include_dump_tables_file = self.include_dump_tables_file,
+                                                        exclude_dump_tables_file = self.exclude_dump_tables_file,
                                                         backup_dir = self.backup_dir,
                                                         free_space_percent = self.free_space_percent,
                                                         compress = self.compress,
@@ -715,16 +759,34 @@ class DumpDatabase(Operation):
                                                         incremental = self.incremental,
                                                         include_schema_file = self.include_schema_file).run()
 
-        if self.incremental and self.dump_prefix \
-                            and get_filter_file(self.dump_database, self.master_datadir, self.backup_dir, self.dump_dir, self.dump_prefix, self.ddboost, self.netbackup_service_host):
+        # create filter file based on the include_dump_tables_file before we do formating of contents
+        if self.dump_prefix and not self.incremental:
+            self.create_filter_file()
+
+        # Format sql strings for all schema and table names
+        self.include_dump_tables_file = formatSQLString(rel_file=self.include_dump_tables_file, isTableName=True)
+        self.exclude_dump_tables_file = formatSQLString(rel_file=self.exclude_dump_tables_file, isTableName=True)
+        self.include_schema_file = formatSQLString(rel_file=self.include_schema_file, isTableName=False)
+        
+        #here
+        if (self.incremental and self.dump_prefix and
+            get_filter_file(self.dump_database, self.master_datadir, self.backup_dir, self.dump_dir,
+                            self.dump_prefix, self.ddboost, self.ddboost_storage_unit, self.netbackup_service_host)):
+
             filtered_dump_line = self.create_filtered_dump_string(getUserName(), DUMP_DATE, TIMESTAMP_KEY)
             (start, end, rc) = self.perform_dump('Dump process', filtered_dump_line)
-            return self.create_dump_outcome(start, end, rc)
-        dump_line = self.create_dump_string(getUserName(), DUMP_DATE, TIMESTAMP_KEY)
-        (start, end, rc) = self.perform_dump('Dump process', dump_line)
-        if self.dump_prefix and self.include_dump_tables_file and not self.incremental:
-            self.create_filter_file()
+        else:
+            dump_line = self.create_dump_string(getUserName(), DUMP_DATE, TIMESTAMP_KEY)
+            (start, end, rc) = self.perform_dump('Dump process', dump_line)
+
+        self.cleanup_files_on_segments()
         return self.create_dump_outcome(start, end, rc)
+
+    def cleanup_files_on_segments(self):
+        for tmp_file in [self.include_dump_tables_file, self.exclude_dump_tables_file, self.include_schema_file]:
+            if tmp_file and os.path.isfile(tmp_file):
+                os.remove(tmp_file)
+                remove_file_on_segments(self.master_port, tmp_file, self.batch_default)
 
     def perform_dump(self, title, dump_line):
         logger.info("%s command line %s" % (title, dump_line))
@@ -751,13 +813,13 @@ class DumpDatabase(Operation):
                                                self.dump_dir,
                                                self.dump_prefix,
                                                TIMESTAMP_KEY)
-        if self.include_dump_tables_file[0]:
-            shutil.copyfile(self.include_dump_tables_file[0], filter_name)
-            verify_lines_in_file(filter_name, get_lines_from_file(self.include_dump_tables_file[0]))
+        if self.include_dump_tables_file:
+            shutil.copyfile(self.include_dump_tables_file, filter_name)
+            verify_lines_in_file(filter_name, get_lines_from_file(self.include_dump_tables_file))
             if self.netbackup_service_host:
                 backup_file_with_nbu(self.netbackup_service_host, self.netbackup_policy, self.netbackup_schedule, self.netbackup_block_size, self.netbackup_keyword, filter_name)
-        elif self.exclude_dump_tables_file[0]:
-            filters = get_lines_from_file(self.exclude_dump_tables_file[0])
+        elif self.exclude_dump_tables_file:
+            filters = get_lines_from_file(self.exclude_dump_tables_file)
             partitions = get_user_table_list(self.master_port, self.dump_database)
             tables = []
             for p in partitions:
@@ -776,7 +838,7 @@ class DumpDatabase(Operation):
                 'exit_status': rc}
 
     def create_filtered_dump_string(self, user_name, dump_date, timestamp_key):
-        filter_filename = get_filter_file(self.dump_database, self.master_datadir, self.backup_dir, self.dump_dir, self.dump_prefix, self.ddboost, self.netbackup_service_host)
+        filter_filename = get_filter_file(self.dump_database, self.master_datadir, self.backup_dir, self.dump_dir, self.dump_prefix, self.ddboost, self.ddboost_storage_unit, self.netbackup_service_host)
         dump_string = self.create_dump_string(user_name, dump_date, timestamp_key)
         dump_string += ' --incremental-filter=%s' % filter_filename
         return dump_string
@@ -822,30 +884,37 @@ class DumpDatabase(Operation):
         These options get passed-through gp_dump to gp_dump_agent.
         Commented out lines use escaping that would be reasonable, if gp_dump escaped properly.
         """
+        should_dump_schema = self.include_schema_file is not None
         if self.dump_schema:
             logger.info("Adding schema name %s" % self.dump_schema)
             dump_line += " -n \"\\\"%s\\\"\"" % self.dump_schema
             #dump_line += " -n \"%s\"" % self.dump_schema
-        dump_line += " %s" % self.dump_database
+
+        db_name = shellEscape(self.dump_database)
+        dump_line += " %s" % checkAndAddEnclosingDoubleQuote(db_name)
+
         for dump_table in self.include_dump_tables:
-            schema, table = dump_table.split('.')
+            schema, table = split_fqn(dump_table)
             dump_line += " --table=\"\\\"%s\\\"\".\"\\\"%s\\\"\"" % (schema, table)
             #dump_line += " --table=\"%s\".\"%s\"" % (schema, table)
         for dump_table in self.exclude_dump_tables:
-            schema, table = dump_table.split('.')
+            schema, table = split_fqn(dump_table)
             dump_line += " --exclude-table=\"\\\"%s\\\"\".\"\\\"%s\\\"\"" % (schema, table)
             #dump_line += " --exclude-table=\"%s\".\"%s\"" % (schema, table)
-        if self.include_dump_tables_file[0] is not None:
+        if self.include_dump_tables_file is not None and not should_dump_schema:
             dump_line += " --table-file=%s" % self.include_dump_tables_file
-        if self.exclude_dump_tables_file[0] is not None:
+        if self.exclude_dump_tables_file is not None:
             dump_line += " --exclude-table-file=%s" % self.exclude_dump_tables_file
-        if self.include_schema_file is not None and not self.dump_prefix:
+        if should_dump_schema:
             dump_line += " --schema-file=%s" % self.include_schema_file
+
         for opt in self.output_options:
             dump_line += " %s" % opt
 
         if self.ddboost:
             dump_line += " --ddboost"
+        if self.ddboost_storage_unit:
+            dump_line += " --ddboost-storage-unit=%s" % self.ddboost_storage_unit
         if self.incremental:
             logger.info("Adding --incremental")
             dump_line += " --incremental"
@@ -861,7 +930,7 @@ class DumpDatabase(Operation):
 
 class CreateIncrementsFile(Operation):
 
-    def __init__(self, dump_database, full_timestamp, timestamp, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, netbackup_service_host, netbackup_block_size):
+    def __init__(self, dump_database, full_timestamp, timestamp, master_datadir, backup_dir, dump_dir, dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size):
         self.full_timestamp = full_timestamp
         self.timestamp = timestamp
         self.master_datadir = master_datadir
@@ -870,6 +939,7 @@ class CreateIncrementsFile(Operation):
         self.orig_lines_in_file = []
         self.dump_database = dump_database
         self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
         self.dump_dir = dump_dir
         self.dump_prefix = dump_prefix
         self.netbackup_service_host = netbackup_service_host
@@ -878,7 +948,7 @@ class CreateIncrementsFile(Operation):
     def execute(self):
         if os.path.isfile(self.increments_filename):
             CreateIncrementsFile.validate_increments_file(self.dump_database, self.increments_filename, self.master_datadir, self.backup_dir, self.dump_dir, self.dump_prefix,
-                                                          self.ddboost, self.netbackup_service_host, self.netbackup_block_size)
+                                                          self.ddboost, self.ddboost_storage_unit, self.netbackup_service_host, self.netbackup_block_size)
             self.orig_lines_in_file = get_lines_from_file(self.increments_filename)
 
         with open(self.increments_filename, 'a') as fd:
@@ -901,7 +971,7 @@ class CreateIncrementsFile(Operation):
         return len(newlines_in_file) + 1
 
     @staticmethod
-    def validate_increments_file(dump_database, inc_file_name, master_data_dir, backup_dir, dump_dir, dump_prefix, ddboost=False, netbackup_service_host=None, netbackup_block_size=None):
+    def validate_increments_file(dump_database, inc_file_name, master_data_dir, backup_dir, dump_dir, dump_prefix, ddboost=False, ddboost_storage_unit=None, netbackup_service_host=None, netbackup_block_size=None):
 
         tstamps = get_lines_from_file(inc_file_name)
         for ts in tstamps:
@@ -911,7 +981,7 @@ class CreateIncrementsFile(Operation):
             fn = generate_report_filename(master_data_dir, backup_dir, dump_dir, dump_prefix, ts, ddboost)
             ts_in_rpt = None
             try:
-                ts_in_rpt = get_incremental_ts_from_report_file(dump_database, fn, dump_prefix, ddboost, netbackup_service_host, netbackup_block_size)
+                ts_in_rpt = get_incremental_ts_from_report_file(dump_database, fn, dump_prefix, ddboost, ddboost_storage_unit, netbackup_service_host, netbackup_block_size)
             except Exception as e:
                 logger.error(str(e))
 
@@ -1028,16 +1098,24 @@ class PostDumpSegment(Operation):
             logger.error('Could not locate status file: %s' % self.status_file)
             raise NoStatusFile()
         # Ensure that status file indicates successful dump
+        completed = False
+        error_found = False
         with open(self.status_file, 'r') as f:
             for line in f:
                 if line.find("Finished successfully") != -1:
-                    break
+                    completed = True
+                elif line.find("ERROR:") != -1 or line.find("[ERROR]") != -1:
+                    error_found = True
+        if error_found:
+            if completed:
+                logger.warn("Status report file indicates dump completed with errors: %s" % self.status_file)
             else:
-                logger.error("Status report file indicates errors: %s" % self.status_file)
+                logger.error("Status report file indicates dump incomplete with errors: %s" % self.status_file)
+            with open(self.status_file, 'r') as f:
                 for line in f:
                     logger.info(line)
-                logger.error("Status file contents dumped to log file")
-                raise StatusFileError()
+            logger.error("Status file contents dumped to log file")
+            raise StatusFileError()
         # Ensure that dump file exists
         if not os.path.exists(self.dump_file):
             logger.error("Could not locate dump file: %s" % self.dump_file)
@@ -1166,9 +1244,9 @@ class ValidateSegDiskSpace(Operation):
             conn = dbconn.connect(dburl, utility=True)
             if self.include_dump_tables:
                 for dump_table in self.include_dump_tables:
-                    needed_space += execSQLForSingleton(conn, "SELECT pg_relation_size('%s')/1024;" % dump_table)
+                    needed_space += execSQLForSingleton(conn, "SELECT pg_relation_size('%s')/1024;" % pg.escape_string(dump_table))
             else:
-                needed_space = execSQLForSingleton(conn, "SELECT pg_database_size('%s')/1024;" % self.dump_database)
+                needed_space = execSQLForSingleton(conn, "SELECT pg_database_size('%s')/1024;" % pg.escape_string(self.dump_database))
         finally:
             if conn is not None:
                 conn.close()
@@ -1343,7 +1421,7 @@ class ValidateIncludeTargets(Operation):
         for dump_table in dump_tables:
             if '.' not in dump_table:
                 raise ExceptionNoStackTraceNeeded("No schema name supplied for table %s" % dump_table)
-            schema, table = dump_table.split('.')
+            schema, table = split_fqn(dump_table)
             exists = CheckTableExists(schema = schema,
                                       table = table,
                                       database = self.dump_database,
@@ -1381,7 +1459,7 @@ class ValidateExcludeTargets(Operation):
         for dump_table in dump_tables:
             if '.' not in dump_table:
                 raise ExceptionNoStackTraceNeeded("No schema name supplied for exclude table %s" % dump_table)
-            schema, table = dump_table.split('.')
+            schema, table = split_fqn(dump_table)
             exists = CheckTableExists(schema = schema,
                                       table = table,
                                       database = self.dump_database,
@@ -1393,7 +1471,7 @@ class ValidateExcludeTargets(Operation):
                             logger.info("Adding table %s to exclude list" % dump_table)
                             rebuild_excludes.append(dump_table)
                         else:
-                            logger.warn("Schema dump request and exclude table %s not in that schema, ignoring" % dump_table)
+                            logger.warn("Schema dump request and exclude table %s in that schema, ignoring" % dump_table)
             else:
                 logger.warn("Exclude table %s does not exist in %s database, ignoring" % (dump_table, self.dump_database))
         if len(rebuild_excludes) == 0:
@@ -1411,7 +1489,8 @@ class ValidateDatabaseExists(Operation):
         try:
             dburl = dbconn.DbURL(port=self.master_port)
             conn = dbconn.connect(dburl)
-            count = execSQLForSingleton(conn, "select count(*) from pg_database where datname='%s';" % self.database)
+            count = execSQLForSingleton(conn, "select count(*) from pg_database where datname='%s';" %
+                                        pg.escape_string(self.database))
             if count == 0:
                 raise ExceptionNoStackTraceNeeded("Database %s does not exist." % self.database)
         finally:
@@ -1430,7 +1509,8 @@ class ValidateSchemaExists(Operation):
         try:
             dburl = dbconn.DbURL(port=self.master_port, dbname=self.database)
             conn = dbconn.connect(dburl)
-            count = execSQLForSingleton(conn, "select count(*) from pg_namespace where nspname='%s';" % self.schema)
+            count = execSQLForSingleton(conn, "select count(*) from pg_namespace where nspname='%s';" %
+                                        pg.escape_string(self.schema))
             if count == 0:
                 raise ExceptionNoStackTraceNeeded("Schema %s does not exist in database %s." % (self.schema, self.database))
         finally:
@@ -1447,12 +1527,13 @@ class CheckTableExists(Operation):
         if CheckTableExists.all_tables is None:
             CheckTableExists.all_tables = set()
             for (schema, table) in get_user_table_list(self.master_port, self.database):
-                CheckTableExists.all_tables.add((schema, table))
-
+                CheckTableExists.all_tables.add((schema,
+                                                 table))
     def execute(self):
         if (self.schema, self.table) in CheckTableExists.all_tables:
             return True
         return False
+
 
 class ValidateCluster(Operation):
     def __init__(self, master_port):
@@ -1479,7 +1560,7 @@ class UpdateHistoryTable(Operation):
         self.master_port = master_port
 
     def execute(self):
-        schema, table = UpdateHistoryTable.HISTORY_TABLE.split('.')
+        schema, table = split_fqn(UpdateHistoryTable.HISTORY_TABLE)
         exists = CheckTableExists(database = self.dump_database,
                                   schema = schema,
                                   table = table,
@@ -1519,7 +1600,7 @@ class UpdateHistoryTable(Operation):
                 conn.close()
 
 class DumpGlobal(Operation):
-    def __init__(self, timestamp, master_datadir, master_port, backup_dir, dump_dir, dump_prefix, ddboost):
+    def __init__(self, timestamp, master_datadir, master_port, backup_dir, dump_dir, dump_prefix, ddboost, ddboost_storage_unit=None):
         self.timestamp = timestamp
         self.master_datadir = master_datadir
         self.master_port = master_port
@@ -1527,6 +1608,7 @@ class DumpGlobal(Operation):
         self.dump_dir = dump_dir
         self.dump_prefix = dump_prefix
         self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
         self.global_filename = generate_global_filename(self.master_datadir, self.backup_dir, self.dump_dir, self.dump_prefix, DUMP_DATE, self.timestamp)
 
     def execute(self):
@@ -1538,8 +1620,10 @@ class DumpGlobal(Operation):
             abspath = self.global_filename
             relpath = os.path.join(self.dump_dir, DUMP_DATE, "%s%s" % (generate_global_prefix(self.dump_prefix), self.timestamp))
             logger.debug('Copying %s to DDBoost' % abspath)
-            cmd = Command('DDBoost copy of %s' % abspath,
-                          'gpddboost --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath))
+            cmdStr = 'gpddboost --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath)
+            if self.ddboost_storage_unit:
+                cmdStr += ' --ddboost-storage-unit=%s' % self.ddboost_storage_unit
+            cmd = Command('DDBoost copy of %s' % abspath, cmdStr)
             cmd.run(validateAfter=True)
 
     def create_pgdump_command_line(self):
@@ -1548,13 +1632,14 @@ class DumpGlobal(Operation):
 class DumpConfig(Operation):
     # TODO: Should we really just give up if one of the tars fails?
     # TODO: WorkerPool
-    def __init__(self, backup_dir, master_datadir, master_port, dump_dir, dump_prefix, ddboost):
+    def __init__(self, backup_dir, master_datadir, master_port, dump_dir, dump_prefix, ddboost, ddboost_storage_unit=None):
         self.backup_dir = backup_dir
         self.master_datadir = master_datadir
         self.master_port = master_port
         self.dump_dir = dump_dir
         self.dump_prefix = dump_prefix
         self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
 
     def execute(self):
         timestamp = TIMESTAMP_KEY
@@ -1570,8 +1655,10 @@ class DumpConfig(Operation):
             abspath = path
             relpath = os.path.join(self.dump_dir, DUMP_DATE, config_backup_file)
             logger.debug('Copying %s to DDBoost' % abspath)
-            cmd = Command('DDBoost copy of %s' % abspath,
-                          'gpddboost --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath))
+            cmdStr = 'gpddboost --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath)
+            if self.ddboost_storage_unit:
+                cmdStr += ' --ddboost-storage-unit=%s' % self.ddboost_storage_unit
+            cmd = Command('DDBoost copy of %s' % abspath, cmdStr)
             cmd.run(validateAfter=True)
             res = cmd.get_results()
             if res.rc != 0:
@@ -1596,8 +1683,11 @@ class DumpConfig(Operation):
                 abspath = path
                 relpath = os.path.join(self.dump_dir, DUMP_DATE, config_backup_file)
                 logger.debug('Copying %s to DDBoost' % abspath)
+                cmdStr = 'gpddboost --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath)
+                if self.ddboost_storage_unit:
+                    cmdStr += ' --ddboost-storage-unit=%s' % self.ddboost_storage_unit
                 cmd = Command('DDBoost copy of %s' % abspath,
-                              'gpddboost --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath),
+                              cmdStr,
                               ctxt=REMOTE,
                               remoteHost=host)
                 cmd.run(validateAfter=True)
@@ -1609,12 +1699,13 @@ class DumpConfig(Operation):
             return {"exit_status": rc, "timestamp": timestamp}
 
 class DeleteCurrentDump(Operation):
-    def __init__(self, timestamp, master_datadir, master_port, dump_dir, ddboost):
+    def __init__(self, timestamp, master_datadir, master_port, dump_dir, ddboost, ddboost_storage_unit):
         self.timestamp = timestamp
         self.master_datadir = master_datadir
         self.master_port = master_port
         self.dump_dir = dump_dir
         self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
 
     def execute(self):
         try:
@@ -1633,16 +1724,20 @@ class DeleteCurrentDump(Operation):
         if self.ddboost:
             relpath = os.path.join(self.dump_dir, DUMP_DATE)
             logger.debug('Listing %s on DDBoost to locate dump files with timestamp %s' % (relpath, self.timestamp))
-            cmd = Command('DDBoost list dump files',
-                          'gpddboost --listDirectory --dir=%s' % relpath)
+            cmdStr = 'gpddboost --listDirectory --dir=%s' % relpath
+            if self.ddboost_storage_unit:
+                cmdStr += ' --ddboost-storage-unit=%s' % self.ddboost_storage_unit
+            cmd = Command('DDBoost list dump files', cmdStr)
             cmd.run(validateAfter=True)
             for line in cmd.get_results().stdout.splitlines():
                 line = line.strip()
                 if self.timestamp in line:
                     abspath = os.path.join(relpath, line)
                     logger.debug('Deleting %s from DDBoost' % abspath)
-                    cmd = Command('DDBoost delete of %s' % abspath,
-                                  'gpddboost --del-file=%s' % abspath)
+                    cmdStr = 'gpddboost --del-file=%s' % abspath
+                    if self.ddboost_storage_unit:
+                        cmdStr += ' --ddboost-storage-unit=%s' % self.ddboost_storage_unit
+                    cmd = Command('DDBoost delete of %s' % abspath, cmdStr)
                     cmd.run(validateAfter=True)
 
 class DeleteCurrentSegDump(Operation):
@@ -1659,18 +1754,23 @@ class DeleteCurrentSegDump(Operation):
             RemoveFile(os.path.join(path, filename)).run()
 
 class DeleteOldestDumps(Operation):
-    # TODO: This Operation isn't consuming backup_dir. Should it?
-    def __init__(self, master_datadir, master_port, dump_dir, ddboost):
+    def __init__(self, master_datadir, master_port, dump_dir, cleanup_date=None, cleanup_total=None, ddboost=False, ddboost_storage_unit=None):
         self.master_datadir = master_datadir
         self.master_port = master_port
         self.dump_dir = dump_dir
+        self.cleanup_date = cleanup_date  # delete specific dump <YYYYMMDD timestamp>
+        self.cleanup_total = cleanup_total  # delete oldest N dumps <int>
         self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
 
     def execute(self):
         dburl = dbconn.DbURL(port=self.master_port)
         if self.ddboost:
-            cmd = Command('List directories in DDBoost db_dumps dir',
-                          'gpddboost --listDir --dir=%s/ | grep ^[0-9]' % self.dump_dir)
+            cmdStr = 'gpddboost'
+            if self.ddboost_storage_unit:
+                cmdStr += ' --ddboost-storage-unit %s' % self.ddboost_storage_unit
+            cmdStr += ' --listDir --dir=%s/ | grep ^[0-9] ' % self.dump_dir
+            cmd = Command('List directories in DDBoost db_dumps dir', cmdStr)
             cmd.run(validateAfter=False)
             rc = cmd.get_results().rc
             if rc != 0:
@@ -1679,47 +1779,66 @@ class DeleteOldestDumps(Operation):
             old_dates = cmd.get_results().stdout.splitlines()
         else:
             old_dates = ListFiles(os.path.join(self.master_datadir, 'db_dumps')).run()
+
         try:
             old_dates.remove(DUMP_DATE)
         except ValueError:            # DUMP_DATE was not found in old_dates
             pass
+
         if len(old_dates) == 0:
             logger.info("No old backup sets to remove")
             return
-        old_dates.sort()
-        old_date = old_dates[0]
 
-        # Remove the directories on DDBoost only. This will avoid the problem
-        # where we might accidently end up deleting local backup files, but
-        # the intention was to delete only the files on DDboost.
-        if self.ddboost:
-            logger.info("Preparing to remove dump %s from DDBoost" % old_date)
-            cmd = Command('DDBoost cleanup',
-                          'gpddboost --del-dir=%s' % os.path.join(self.dump_dir, old_date))
-            cmd.run(validateAfter=False)
-            rc = cmd.get_results().rc
-            if rc != 0:
-                logger.info("Error encountered during deletion of %s on DDBoost" % os.path.join(self.dump_dir, old_date))
-                logger.debug(cmd.get_results().stdout)
-                logger.debug(cmd.get_results().stderr)
-        else:
-            logger.info("Preparing to remove dump %s from all hosts" % old_date)
-            path = os.path.join(self.master_datadir, 'db_dumps', old_date)
+        delete_old_dates = []
+        if self.cleanup_total:
+            if len(old_dates) < int(self.cleanup_total):
+                logger.warning("Unable to delete %s backups.  Only have %d backups." % (self.cleanup_total, len(old_dates)))
+                return
 
-            try:
-                RemoveTree(path).run()
-            except OSError, e:
-                logger.warn("Error encountered during deletion of %s" % path)
-            gparray = GpArray.initFromCatalog(dbconn.DbURL(port=self.master_port), utility=True)
-            primaries = [seg for seg in gparray.getDbList() if seg.isSegmentPrimary(current_role=True)]
-            for seg in primaries:
-                path = os.path.join(seg.getSegmentDataDirectory(), 'db_dumps', old_date)
+            old_dates.sort()
+            delete_old_dates = delete_old_dates + old_dates[0:int(self.cleanup_total)]
+
+        if self.cleanup_date and self.cleanup_date not in delete_old_dates:
+            if self.cleanup_date not in old_dates:
+                logger.warning("Timestamp dump %s does not exist." % self.cleanup_date)
+                return
+            delete_old_dates.append(self.cleanup_date)
+
+        gparray = GpArray.initFromCatalog(dbconn.DbURL(port=self.master_port), utility=True)
+        primaries = [seg for seg in gparray.getDbList() if seg.isSegmentPrimary(current_role=True)]
+        for old_date in delete_old_dates:
+            # Remove the directories on DDBoost only. This will avoid the problem
+            # where we might accidently end up deleting local backup files, but
+            # the intention was to delete only the files on DDboost.
+            if self.ddboost:
+                logger.info("Preparing to remove dump %s from DDBoost" % old_date)
+                cmdStr = 'gpddboost --del-dir=%s' % os.path.join(self.dump_dir, old_date)
+                if self.ddboost_storage_unit:
+                    cmdStr += ' --ddboost-storage-unit %s' % self.ddboost_storage_unit
+                cmd = Command('DDBoost cleanup', cmdStr)
+                cmd.run(validateAfter=False)
+                rc = cmd.get_results().rc
+                if rc != 0:
+                    logger.info("Error encountered during deletion of %s on DDBoost" % os.path.join(self.dump_dir, old_date))
+                    logger.debug(cmd.get_results().stdout)
+                    logger.debug(cmd.get_results().stderr)
+            else:
+                logger.info("Preparing to remove dump %s from all hosts" % old_date)
+                path = os.path.join(self.master_datadir, 'db_dumps', old_date)
+
                 try:
-                    RemoveRemoteTree(path, seg.getSegmentHostName()).run()
-                except ExecutionError, e:
-                    logger.warn("Error encountered during deletion of %s on %s" % (path, seg.getSegmentHostName()))
+                    RemoveTree(path).run()
+                except OSError, e:
+                    logger.warn("Error encountered during deletion of %s" % path)
 
-        return old_date
+                for seg in primaries:
+                    path = os.path.join(seg.getSegmentDataDirectory(), 'db_dumps', old_date)
+                    try:
+                        RemoveRemoteTree(path, seg.getSegmentHostName()).run()
+                    except ExecutionError, e:
+                        logger.warn("Error encountered during deletion of %s on %s" % (path, seg.getSegmentHostName()))
+
+        return delete_old_dates
 
 class VacuumDatabase(Operation):
     # TODO: move this to gppylib.operations.common?
@@ -1794,3 +1913,184 @@ class MailEvent(Operation):
             command_str = 'echo "%s" | %s -s "%s" %s -- -f %s' % (self.message, cmd, self.subject, " ".join(self.to_addrs), self.sender)
         logger.debug("Email command string= %s" % command_str)
         Command('Sending email', command_str).run(validateAfter=True)
+
+class DumpStats(Operation):
+    def __init__(self, timestamp, master_datadir, dump_database, master_port, backup_dir, dump_dir, dump_prefix,
+                 include_table_file, exclude_table_file, include_schema_file, ddboost, ddboost_storage_unit):
+        self.timestamp = timestamp
+        self.master_datadir = master_datadir
+        self.dump_database = dump_database
+        self.master_port = master_port
+        self.backup_dir = backup_dir
+        self.dump_dir = dump_dir
+        self.dump_prefix = dump_prefix
+        self.include_table_file = include_table_file
+        self.exclude_table_file = exclude_table_file
+        self.include_schema_file = include_schema_file
+        self.ddboost = ddboost
+        self.ddboost_storage_unit = ddboost_storage_unit
+        self.stats_filename = generate_stats_filename(self.master_datadir, self.backup_dir, self.dump_dir, self.dump_prefix, DUMP_DATE, self.timestamp)
+
+    def execute(self):
+        logger.info("Commencing pg_statistic dump")
+
+        include_tables = []
+        if self.exclude_table_file:
+            exclude_tables = get_lines_from_file(self.exclude_table_file)
+            user_tables = get_user_table_list(self.master_port, self.dump_database)
+            tables = []
+            for table in user_tables:
+                tables.append("%s.%s" % (table[0], table[1]))
+            include_tables = list(set(tables) - set(exclude_tables))
+        elif self.include_table_file:
+            include_tables = get_lines_from_file(self.include_table_file)
+        elif self.include_schema_file:
+            include_schemas = get_lines_from_file(self.include_schema_file)
+            for schema in include_schemas:
+                user_tables = get_user_table_list_for_schema(self.master_port, self.dump_database, schema)
+                tables = []
+                for table in user_tables:
+                    tables.append("%s.%s" % (table[0], table[1]))
+                include_tables.extend(tables)
+        else:
+            user_tables = get_user_table_list(self.master_port, self.dump_database)
+            for table in user_tables:
+                include_tables.append("%s.%s" % (table[0], table[1]))
+
+        with open(self.stats_filename, "w") as outfile:
+            outfile.write("""--
+-- Allow system table modifications
+--
+set allow_system_table_mods="DML";
+
+""")
+        for table in sorted(include_tables):
+            self.dump_table(table)
+
+        if self.ddboost:
+            abspath = self.stats_filename
+            relpath = os.path.join(self.dump_dir, DUMP_DATE, "%s%s" % (generate_stats_prefix(self.dump_prefix), self.timestamp))
+            logger.debug('Copying %s to DDBoost' % abspath)
+            cmdStr = 'gpddboost'
+            if self.ddboost_storage_unit:
+                cmdStr +=  ' --ddboost-storage-unit=%s' % self.ddboost_storage_unit
+            cmdStr += ' --copyToDDBoost --from-file=%s --to-file=%s' % (abspath, relpath)
+            cmd = Command('DDBoost copy of %s' % abspath, cmdStr)
+            cmd.run(validateAfter=True)
+
+    def dump_table(self, table):
+        schemaname, tablename = table.split(".")
+        schemaname = pg.escape_string(schemaname)
+        tablename = pg.escape_string(tablename)
+        tuples_query = """SELECT pgc.relname, pgn.nspname, pgc.relpages, pgc.reltuples
+                          FROM pg_class pgc, pg_namespace pgn
+                          WHERE pgc.relnamespace = pgn.oid
+                              and pgn.nspname = E'%s'
+                              and pgc.relname = E'%s'""" % (schemaname, tablename)
+        stats_query = """SELECT pgc.relname, pgn.nspname, pga.attname, pgt.typname, pgs.*
+                         FROM pg_class pgc, pg_statistic pgs, pg_namespace pgn, pg_attribute pga, pg_type pgt
+                         WHERE pgc.relnamespace = pgn.oid
+                             and pgn.nspname = E'%s'
+                             and pgc.relname = E'%s'
+                             and pgc.oid = pgs.starelid
+                             and pga.attrelid = pgc.oid
+                             and pga.attnum = pgs.staattnum
+                             and pga.atttypid = pgt.oid""" % (schemaname, tablename)
+
+
+        self.dump_tuples(tuples_query)
+        self.dump_stats(stats_query)
+
+    def dump_tuples(self, query):
+        rows = execute_sql(query, self.master_port, self.dump_database)
+        for row in rows:
+            if len(row) != 4:
+                raise Exception("Invalid return from query: Expected 4 columns, got % columns" % (len(row)))
+            self.print_tuples(row)
+
+    def dump_stats(self, query):
+        rows = execute_sql(query, self.master_port, self.dump_database)
+        for row in rows:
+            if len(row) != 25:
+                raise Exception("Invalid return from query: Expected 25 columns, got % columns" % (len(row)))
+            self.print_stats(row)
+
+    def print_tuples(self, row):
+        relname, relnsp, relpages, reltup = row
+        with open(self.stats_filename, "a") as outfile:
+            outfile.write("""--
+-- Schema: %s, Table: %s
+--
+UPDATE pg_class
+SET
+    relpages = %s::int,
+    reltuples = %d::real
+WHERE relname = '%s' AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = '%s');
+
+""" % (relnsp, relname, relpages, int(reltup), relname, relnsp))
+
+    def print_stats(self, row):
+        relname, nspname, attname, typname, starelid, staattnum, stanullfrac, stawidth, stadistinct, stakind1, stakind2, \
+            stakind3, stakind4, staop1, staop2, staop3, staop4, stanumbers1, stanumbers2, stanumbers3, stanumbers4, stavalues1, \
+            stavalues2, stavalues3, stavalues4 = row
+        smallints = [stakind1, stakind2, stakind3, stakind4]
+        oids = [staop1, staop2, staop3, staop4]
+        reals = [stanumbers1, stanumbers2, stanumbers3, stanumbers4]
+        anyarrays = [stavalues1, stavalues2, stavalues3, stavalues4]
+
+        with open(self.stats_filename, "a") as outfile:
+            outfile.write("""--
+-- Schema: %s, Table: %s, Attribute: %s
+--
+INSERT INTO pg_statistic VALUES (
+    %d::oid,
+    %d::smallint,
+    %f::real,
+    %d::integer,
+    %f::real,
+""" % (nspname, relname, attname, starelid, staattnum, stanullfrac, stawidth, stadistinct))
+
+            # If a typname starts with exactly one it describes an array type
+            # We can't restore statistics of array columns, so we'll zero and NULL everything out
+            if typname[0] == '_' and typname[1] != '_':
+                arrayformat = """    0::smallint,
+            0::smallint,
+            0::smallint,
+            0::smallint,
+            0::oid,
+            0::oid,
+            0::oid,
+            0::oid,
+            NULL::real[],
+            NULL::real[],
+            NULL::real[],
+            NULL::real[],
+            NULL,
+            NULL,
+            NULL,
+            NULL
+        );"""
+                outfile.write(arrayformat)
+            else:
+                for s in smallints:
+                    outfile.write("    %d::smallint,\n" % s)
+                for o in oids:
+                    outfile.write("    %d::oid,\n" % o)
+                for r in reals:
+                    if r is None:
+                        outfile.write("    NULL::real[],\n")
+                    else:
+                        strR = str(r)
+                        outfile.write("    '{%s}'::real[],\n" % strR[1:len(strR)-1])
+                for l in range(len(anyarrays)):
+                    a = anyarrays[l]
+                    if a is None:
+                        outfile.write("    NULL::%s[]" % typname)
+                    else:
+                        strA = str(a)
+                        outfile.write("    '{%s}'::%s[]" % (strA[1:len(strA)-1], typname))
+                    if l < len(anyarrays)-1:
+                        outfile.write(",")
+                    outfile.write("\n")
+                outfile.write(");")
+            outfile.write("\n\n")

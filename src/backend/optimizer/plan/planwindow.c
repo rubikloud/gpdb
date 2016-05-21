@@ -93,6 +93,7 @@ typedef struct WindowInfo
 	bool	needauxcount;
 	
 	AttrNumber *partkey_attrs;
+	Oid		   *partkey_operators;		/* array of equality operators */
 	List	   *key_list;
 	
 	/* coplan assembly */
@@ -1212,6 +1213,10 @@ static int compare_order(List *a, List* b)
 			return -1;
 		else if ( sca->sortop > scb->sortop )
 			return 1;
+		else if ( sca->nulls_first && !scb->nulls_first )
+			return -1;
+		else if ( !sca->nulls_first && scb->nulls_first )
+			return 1;
 	}
 	na = list_length(a);
 	nb = list_length(b);
@@ -1509,20 +1514,25 @@ make_lower_targetlist(Query *parse,
 }
 
 
-static void set_window_keys(WindowContext *context, int wind_index)
+static void
+set_window_keys(WindowContext *context, int wind_index)
 {
 	WindowInfo *winfo;
-	int i, j;
-	int skoffset, nextsk;
-	ListCell *lc;
-	int nattrs;
-	AttrNumber* sortattrs = NULL;
-	Oid* sortops = NULL;
+	int			i,
+				j;
+	int			skoffset,
+				nextsk;
+	ListCell   *lc;
+	int			nattrs;
+	AttrNumber *sortattrs = NULL;
+	Oid		   *sortops = NULL;
+	bool	   *nullsFirstFlags = NULL;
 	
 	/* results  */
-	int partkey_len = 0;
+	int			partkey_len = 0;
 	AttrNumber *partkey_attrs = NULL;
-	List *window_keys = NIL;
+	Oid		   *partkey_operators = NULL;
+	List	   *window_keys = NIL;
 	
 	Assert( 0 <= wind_index && wind_index < context->nwindowinfos );
 	
@@ -1534,23 +1544,32 @@ static void set_window_keys(WindowContext *context, int wind_index)
 	{
 		sortattrs = (AttrNumber *)palloc(nattrs*sizeof(AttrNumber));
 		sortops = (Oid *)palloc(nattrs*sizeof(Oid));
+		nullsFirstFlags = (bool *) palloc(nattrs * sizeof(bool));
 		i = 0;
 		foreach ( lc, winfo->sortclause )
 		{
 			SortClause *sc = (SortClause *)lfirst(lc);
 			sortattrs[i] = context->sortref_resno[sc->tleSortGroupRef];
 			sortops[i] = sc->sortop;
+			nullsFirstFlags[i] = sc->nulls_first;
 			i++;
 		}
 	}
-	
+
 	/* Make a separate copy of just the partition key. */
 	if ( winfo->partkey_len > 0 )
 	{
 		partkey_len = winfo->partkey_len;
 		partkey_attrs = (AttrNumber *)palloc(partkey_len*sizeof(AttrNumber));
+		partkey_operators = (Oid *) palloc(partkey_len * sizeof(Oid));
 		for ( i = 0; i < partkey_len; i++ )
+		{
 			partkey_attrs[i] = sortattrs[i];
+			partkey_operators[i] = get_equality_op_for_ordering_op(sortops[i]);
+			if (!OidIsValid(partkey_operators[i]))		/* shouldn't happen */
+				elog(ERROR, "could not find equality operator for ordering operator %u",
+					 sortops[i]);
+		}
 	}
 	
 	/* Careful.  Within sort key, parition key may overlap order keys. */
@@ -1588,11 +1607,13 @@ static void set_window_keys(WindowContext *context, int wind_index)
 		{
 			wkey->sortColIdx = (AttrNumber*)palloc(wkey->numSortCols * sizeof(AttrNumber));
 			wkey->sortOperators = (Oid*)palloc(wkey->numSortCols * sizeof(Oid));
-			
+			wkey->nullsFirst = (bool *) palloc(wkey->numSortCols * sizeof(bool));
+
 			for ( j = 0; j < wkey->numSortCols; j++ )
 			{
 				wkey->sortColIdx[j] = sortattrs[nextsk];
 				wkey->sortOperators[j] = sortops[nextsk]; /* TODO SET THIS CORRECTLY!!! */
+				wkey->nullsFirst[j] = nullsFirstFlags[nextsk];
 				nextsk++;
 			}
 		}
@@ -1605,9 +1626,11 @@ static void set_window_keys(WindowContext *context, int wind_index)
 			wkey->numSortCols = 1;
 			wkey->sortColIdx = (AttrNumber *)palloc(sizeof(AttrNumber));
 			wkey->sortOperators = (Oid*)palloc(sizeof(Oid));
+			wkey->nullsFirst = (bool *) palloc(sizeof(bool));
 			sc = (SortClause *)linitial(sinfo->order);
 			wkey->sortColIdx[0] = context->sortref_resno[sc->tleSortGroupRef];
 			wkey->sortOperators[0] = sc->sortop;
+			wkey->nullsFirst[0] = sc->nulls_first;
 		}
 		
 		wkey->frame = copyObject(sinfo->frame);
@@ -1616,6 +1639,7 @@ static void set_window_keys(WindowContext *context, int wind_index)
 	}
 	
 	winfo->partkey_attrs = partkey_attrs;
+	winfo->partkey_operators = partkey_operators;
 	winfo->key_list = window_keys;
 }
 
@@ -1749,7 +1773,7 @@ static Plan *plan_common_subquery(PlannerInfo *root, List *lower_tlist,
 	/* If an order hint is specified, try for it.   */
 	if ( order_hint != NIL )
 	{
-		root->query_pathkeys = make_pathkeys_for_sortclauses(order_hint, lower_tlist);
+		root->query_pathkeys = make_pathkeys_for_sortclauses(root, order_hint, lower_tlist, true);
 		root->sort_pathkeys = root->query_pathkeys;
 	}
 
@@ -1831,10 +1855,9 @@ Plan *assure_collocation_and_order(
 	
 	if ( sortclause != NIL )
 	{
-		sort_pathkeys = make_pathkeys_for_sortclauses(sortclause, input_plan->targetlist);
+		sort_pathkeys = make_pathkeys_for_sortclauses(root, sortclause, input_plan->targetlist, true);
 		if ( root != NULL )
 			sort_pathkeys = canonicalize_pathkeys(root, sort_pathkeys);
-		Assert(sort_pathkeys != NULL);
 	}
 	
 	if ( partkey_len == 0 ) /* Plan for single process locus. */
@@ -1874,12 +1897,12 @@ Plan *assure_collocation_and_order(
 			if ( 0 >= n-- ) break;
 			dist_keys = lappend(dist_keys, lfirst(lc));
 		}
-		dist_pathkeys = make_pathkeys_for_sortclauses(dist_keys, input_plan->targetlist);
+		dist_pathkeys = make_pathkeys_for_sortclauses(root, dist_keys, input_plan->targetlist, true);
 		if ( root != NULL )
 			dist_pathkeys = canonicalize_pathkeys(root, dist_pathkeys);
 		
 		/* Assure the required distribution. */
-		if ( ! cdbpathlocus_collocates(input_locus, dist_pathkeys, false /*exact_match*/) )
+		if ( ! cdbpathlocus_collocates(root, input_locus, dist_pathkeys, false /*exact_match*/) )
 		{
 			foreach (lc, dist_keys)
 			{
@@ -1938,10 +1961,9 @@ Plan *assure_order(
 
 	if ( sortclause != NIL )
 	{
-		sort_pathkeys = make_pathkeys_for_sortclauses(sortclause, input_plan->targetlist);
+		sort_pathkeys = make_pathkeys_for_sortclauses(root, sortclause, input_plan->targetlist, true);
 		if ( root != NULL )
 			sort_pathkeys = canonicalize_pathkeys(root, sort_pathkeys);
-		Assert(sort_pathkeys != NULL);
 	}
 
 	if(sort_pathkeys != NULL)
@@ -1983,7 +2005,7 @@ static Plan *plan_trivial_window_query(PlannerInfo *root, WindowContext *context
 								  &pathkeys);
 								  
 	
-	window_pathkeys = make_pathkeys_for_sortclauses(winfo->sortclause, lower_tlist);
+	window_pathkeys = make_pathkeys_for_sortclauses(root, winfo->sortclause, lower_tlist, true);
 	window_pathkeys = canonicalize_pathkeys(root, window_pathkeys);
 	
 	/* Assure needed colocation and order. */
@@ -1998,7 +2020,7 @@ static Plan *plan_trivial_window_query(PlannerInfo *root, WindowContext *context
 	
 	/* Add the single Window node. */
 	result_plan = (Plan*) make_window(root, context->upper_tlist, 
-									  winfo->partkey_len, winfo->partkey_attrs,
+									  winfo->partkey_len, winfo->partkey_attrs, winfo->partkey_operators,
 									  winfo->key_list, /* XXX copy? */
 									  result_plan);
 	
@@ -2311,7 +2333,7 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 		AttrNumber *grpcolidx = NULL;
 		List *share_partners = NIL;
 		List *tlist = NIL;
-			
+
 		/* elog(NOTICE, "Fn plan_sequential_stage(): Preparing for Agg."); */
 
 		/* Since we'll be encountering some Agg targets.  Prepare for that 
@@ -2399,6 +2421,7 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 					strategy, false,
 					winfo->partkey_len, 
 					grpcolidx,
+					winfo->partkey_operators,
 				    num_groups,
 				    0, /* num_nullcols */
 				    0, /* input_grouping */
@@ -2408,7 +2431,7 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 					0, /* transSpace */
 					agg_plan /* now just the shared input */
 					);
-		
+
 		agg_plan->flow = pull_up_Flow(agg_plan, agg_plan->lefttree, true);
 		
 		/* Later we'll package this Agg plan as the second sub-query RTE
@@ -2450,22 +2473,29 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 		/* Initialize a Window node for this WindowInfo. 
 		 */
 		{
-			size_t sz = winfo->partkey_len * sizeof(AttrNumber);
 			AttrNumber *partkey = NULL;
+			Oid		   *partkey_operators = NULL;
 			
 			/* elog(NOTICE, "Fn plan_sequential_stage(): Adding Window node."); */
 
 			if ( winfo->partkey_len > 0 )
 			{
-				partkey = (AttrNumber*)palloc(sz);
+				size_t sz;
+
+				sz = winfo->partkey_len * sizeof(AttrNumber);
+				partkey = (AttrNumber *) palloc(sz);
 				memcpy(partkey, winfo->partkey_attrs, sz);
+
+				sz = winfo->partkey_len * sizeof(Oid);
+				partkey_operators = (Oid *) palloc(sz);
+				memcpy(partkey_operators, winfo->partkey_operators, sz);
 			}
-			
+
 			window_plan = (Plan *)make_window(
 							root,
 							copyObject(window_plan->targetlist),
 							winfo->partkey_len,
-							partkey,
+							partkey, partkey_operators,
 							(List*) translate_upper_vars_sequential((Node*)winfo->key_list, context), /* XXX mutate windowKeys to translate any Var nodes in frame vals. */
 							window_plan);
 							
@@ -2618,8 +2648,6 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 	if ( hasagg )
 	{
 		Plan *join_plan = NULL;
-		List	   *mergefamilies;
-		List	   *mergestrategies;
 		
 		agg_plan = add_join_to_wrapper(root, agg_plan, agg_subquery, join_tlist,
 									   winfo->partkey_len,
@@ -2641,8 +2669,11 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 		 */		
 		 if ( winfo->partkey_len > 0 )
 		 {
-			List *mergeclauses = NIL;
-			
+			List	   *mergeclauses = NIL;
+			Oid		   *mergefamilies = palloc(sizeof(Oid) * winfo->partkey_len);
+			int		   *mergestrategies = palloc(sizeof(int) * winfo->partkey_len);
+			bool	   *mergenullsfirst = palloc(sizeof(bool) * winfo->partkey_len);
+
 			for ( i = 0; i < winfo->partkey_len; i++ )
 			{
 				TargetEntry *tle;
@@ -2657,11 +2688,15 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 									   0);
 
 				mc = make_mergeclause(lft, rgt);
-				mergeclauses = lappend(mergeclauses, mc);
-			}
 
-			build_mergejoin_strat_lists(mergeclauses, &mergefamilies,
-										&mergestrategies);
+				if (!mc->mergeopfamilies)
+					elog(ERROR, "failed to find mergejoinable operator family for partition key");
+
+				mergeclauses = lappend(mergeclauses, mc);
+				mergefamilies[i] = linitial_oid(mc->mergeopfamilies);
+				mergestrategies[i] = BTLessStrategyNumber;
+				mergenullsfirst[i] = false;
+			}
 
 			mergeclauses = get_actual_clauses(mergeclauses);
 			join_plan = (Plan *) make_mergejoin(join_tlist,
@@ -2669,6 +2704,7 @@ static Plan *plan_sequential_stage(PlannerInfo *root,
 												mergeclauses,
 												mergefamilies,
 												mergestrategies,
+												mergenullsfirst,
 												agg_plan, window_plan,
 												JOIN_INNER);
 			((MergeJoin*)join_plan)->unique_outer = true;
@@ -2754,9 +2790,9 @@ static Plan *plan_parallel_window_query(PlannerInfo *root, WindowContext *contex
 		context->keyed_lower_tlist = lower_tlist;
 		
 		subplan = (Plan*) make_window(root, lower_tlist, 
-										  0, NULL, /* No paritioning */
-										  NIL, /* No ordering */
-										  subplan);
+									  0, NULL, NULL, /* No partitioning */
+									  NIL, /* No ordering */
+									  subplan);
 		if (!subplan->flow)
 			subplan->flow = pull_up_Flow(subplan, 
 											 subplan->lefttree, 
@@ -2825,7 +2861,7 @@ static Plan *plan_parallel_window_query(PlannerInfo *root, WindowContext *contex
 						
 		root->group_pathkeys = NIL;
 		root->sort_pathkeys = 
-			make_pathkeys_for_sortclauses(root->parse->sortClause, targetlist);
+			make_pathkeys_for_sortclauses(root, root->parse->sortClause, targetlist, true);
 		root->query_pathkeys = root->sort_pathkeys;
 		
 		query_planner(root, targetlist, 0.0, &cheapest_path, &sorted_path, &ngroups);
@@ -3235,9 +3271,9 @@ static RangeTblEntry *rte_for_coplan(
 		case COPLAN_WINDOW:
 			new_plan = (Plan*) 
 				make_window(root, coplan->targetlist, 
-						winfo->partkey_len, winfo->partkey_attrs,
-						winfo->key_list, /* XXX copy? */
-						new_plan);
+							winfo->partkey_len, winfo->partkey_attrs, winfo->partkey_operators,
+							winfo->key_list, /* XXX copy? */
+							new_plan);
 		break;
 	case COPLAN_AGG:
 		if ( coplan->partkey_len > 0 )
@@ -3247,11 +3283,11 @@ static RangeTblEntry *rte_for_coplan(
 			/* TODO Fix this cheesy estimate. */
 			double d = new_plan->plan_rows / 100.0;
 			long num_groups = (d < 0)? 0: ( d > LONG_MAX )? LONG_MAX: (long)d;
-			
+
 			new_plan = (Plan*)
 				make_agg(root, coplan->targetlist, NULL,
 						 AGG_SORTED, false,
-						 winfo->partkey_len, winfo->partkey_attrs,
+						 winfo->partkey_len, winfo->partkey_attrs, winfo->partkey_operators,
 						 num_groups,
 						 0, /* num_nullcols */
 						 0, /* input_grouping */
@@ -3266,7 +3302,7 @@ static RangeTblEntry *rte_for_coplan(
 			new_plan = (Plan*)
 				make_agg(root, coplan->targetlist, NULL,
 						 AGG_PLAIN, false,
-						 0, NULL,
+						 0, NULL, NULL,
 						 1, /* number of groups */
 						 0, /* num_nullcols */
 						 0, /* input_grouping */
@@ -3834,6 +3870,10 @@ static Node * translate_upper_vars_sequential_mutator(Node *node, xuv_context *c
 			sz = key->numSortCols * sizeof(Oid);
 			newkey->sortOperators = (Oid*)palloc(sz);
 			memcpy(newkey->sortOperators, key->sortOperators, sz);
+
+			sz = key->numSortCols * sizeof(bool);
+			newkey->nullsFirst = (bool *) palloc(sz);
+			memcpy(newkey->nullsFirst, key->nullsFirst, sz);
 		}
 		
 		newkey->frame = (WindowFrame*)expression_tree_mutator(
@@ -4051,15 +4091,6 @@ Plan *wrap_plan(PlannerInfo *root, Plan *plan, Query *query,
 	subquery->returningLists = NIL;
 	
 	... */
-
-	/* Reconstruct equi_key_list since the rtable has changed.
-	 * XXX we leak the old one.
-	 */
-	root->equi_key_list =
-		construct_equivalencekey_list(root->equi_key_list,
-									  resno_map,
-									  ((SubqueryScan *)plan)->subplan->targetlist,
-									  subq_tlist);
 
 	/* Construct the new pathkeys */
 	if (p_pathkeys != NULL)

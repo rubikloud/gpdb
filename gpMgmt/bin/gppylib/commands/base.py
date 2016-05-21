@@ -155,6 +155,8 @@ class WorkerPool(object):
         self.logger.debug("WorkerPool haltWork()")
         for w in self.workers:
             w.haltWork()    
+        for i in range(0,self.numWorkers):
+            self.work_queue.put('dummy command')
 
 
 class OperationWorkerPool(WorkerPool):
@@ -204,8 +206,8 @@ class Worker(Thread):
                     self.cmd = self.pool.getNextWorkItem(timeout=self.timeout)
                 except TypeError:
                     # misleading exception raised during interpreter shutdown
-                    return
-                
+                    return 
+
                 if self.cmd is not None and not self.shouldStop:
                     self.logger.debug("[%s] got cmd: %s" % (self.name,self.cmd.cmdStr))
                     self.cmd.run()

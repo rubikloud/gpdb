@@ -10,7 +10,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootparse.y,v 1.85 2007/01/05 22:19:24 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/bootstrap/bootparse.y,v 1.86 2007/01/09 02:14:11 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -33,10 +33,8 @@
 #include "catalog/gp_fastsequence.h"
 #include "catalog/gp_san_config.h"
 #include "catalog/gp_segment_config.h"
-#include "catalog/gp_verification_history.h"
 #include "catalog/heap.h"
 #include "catalog/pg_am.h"
-#include "catalog/pg_appendonly_alter_column.h"
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_auth_members.h"
@@ -280,6 +278,7 @@ Boot_CreateStmt:
 								break;
 						}
 
+						Oid typarrayid = InvalidOid;
 						id = heap_create_with_catalog(LexIDStr($5),
 													  PG_CATALOG_NAMESPACE,
 													  $3 ? GLOBALTABLESPACE_OID : 0,
@@ -299,6 +298,7 @@ Boot_CreateStmt:
 													  true,
 													  /* valid_opts */ false,
 													  &typid,
+													  &typarrayid,
 						 					  		  /* persistentTid */ NULL,
 						 					  		  /* persistentSerialNum */ NULL);
 						elog(DEBUG4, "relation created with oid %u", id);
@@ -400,6 +400,8 @@ boot_index_param:
 					n->name = LexIDStr($1);
 					n->expr = NULL;
 					n->opclass = list_make1(makeString(LexIDStr($2)));
+					n->ordering = SORTBY_DEFAULT;
+					n->nulls_ordering = SORTBY_NULLS_DEFAULT;
 					$$ = n;
 				}
 		;

@@ -8,7 +8,7 @@
  * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/nodes/execnodes.h,v 1.166 2007/01/05 22:19:55 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/nodes/execnodes.h,v 1.167 2007/02/06 02:59:13 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -23,6 +23,7 @@
 #include "utils/hsearch.h"
 #include "gpmon/gpmon.h"                /* gpmon_packet_t */
 #include "utils/tuplestore.h"
+#include "codegen/codegen_wrapper.h"
 
 /*
  * partition selector ids start from 1. Sometimes we use 0 to initialize variables
@@ -217,6 +218,14 @@ typedef struct ReturnSetInfo
 	TupleDesc	setDesc;		/* actual descriptor for returned tuples */
 } ReturnSetInfo;
 
+typedef struct ExecVariableListCodegenInfo
+{
+	/* Pointer to store ExecVariableListCodegen from Codegen */
+	void* code_generator;
+	/* Function pointer that points to either regular or generated slot_deform_tuple */
+	ExecVariableListFn ExecVariableList_fn;
+} ExecVariableListCodegenInfo;
+
 /* ----------------
  *		ProjectionInfo node information
  *
@@ -260,6 +269,10 @@ typedef struct ProjectionInfo
 	int			pi_lastInnerVar;
 	int			pi_lastOuterVar;
 	int			pi_lastScanVar;
+
+#ifdef USE_CODEGEN
+    ExecVariableListCodegenInfo ExecVariableList_gen_info;
+#endif
 } ProjectionInfo;
 
 /* ----------------
@@ -679,6 +692,16 @@ typedef struct ExecRowMark
  *				 Tuple Hash Tables
  *
  * All-in-memory tuple hash tables are used for a number of purposes.
+ *
+ * Note: tab_hash_funcs are for the key datatype(s) stored in the table,
+ * and tab_eq_funcs are non-cross-type equality operators for those types.
+ * Normally these are the only functions used, but FindTupleHashEntry()
+ * supports searching a hashtable using cross-data-type hashing.  For that,
+ * the caller must supply hash functions for the LHS datatype as well as
+ * the cross-type equality operators to use.  in_hash_funcs and cur_eq_funcs
+ * are set to point to the caller's function arrays while doing such a search.
+ * During LookupTupleHashEntry(), they point to tab_hash_funcs and
+ * tab_eq_funcs respectively.
  * ----------------------------------------------------------------
  */
 typedef struct TupleHashEntryData *TupleHashEntry;
@@ -696,13 +719,16 @@ typedef struct TupleHashTableData
 	HTAB	   *hashtab;		/* underlying dynahash table */
 	int			numCols;		/* number of columns in lookup key */
 	AttrNumber *keyColIdx;		/* attr numbers of key columns */
-	FmgrInfo   *eqfunctions;	/* lookup data for comparison functions */
-	FmgrInfo   *hashfunctions;	/* lookup data for hash functions */
+	FmgrInfo   *tab_hash_funcs;	/* hash functions for table datatype(s) */
+	FmgrInfo   *tab_eq_funcs;	/* equality functions for table datatype(s) */
 	MemoryContext tablecxt;		/* memory context containing table */
 	MemoryContext tempcxt;		/* context for function evaluations */
 	Size		entrysize;		/* actual size to make each hash entry */
 	TupleTableSlot *tableslot;	/* slot for referencing table entries */
+	/* The following fields are set transiently for each table search: */
 	TupleTableSlot *inputslot;	/* current input tuple's slot */
+	FmgrInfo   *in_hash_funcs;	/* hash functions for input datatype(s) */
+	FmgrInfo   *cur_eq_funcs;	/* equality functions for input vs. table */
 } TupleHashTableData;
 
 typedef HASH_SEQ_STATUS TupleHashIterator;
@@ -1054,9 +1080,10 @@ typedef struct SubPlanState
 	MemoryContext hashtempcxt;	/* temp memory context for hash tables */
 	ExprContext *innerecontext;	/* working context for comparisons */
 	AttrNumber *keyColIdx;		/* control data for hash tables */
-	FmgrInfo   *eqfunctions;	/* comparison functions for hash tables */
-	FmgrInfo   *hashfunctions;	/* lookup data for hash functions */
-	struct StringInfoData  *cdbextratextbuf;    /* to pass text to cdbexplain */
+	FmgrInfo   *tab_hash_funcs;	/* hash functions for table datatype(s) */
+	FmgrInfo   *tab_eq_funcs;	/* equality functions for table datatype(s) */
+	FmgrInfo   *lhs_hash_funcs;	/* hash functions for lefthand datatype(s) */
+	FmgrInfo   *cur_eq_funcs;	/* equality functions for LHS vs. table */
 } SubPlanState;
 
 /* ----------------
@@ -1081,6 +1108,33 @@ typedef struct FieldStoreState
 	List	   *newvals;		/* new value(s) for field(s) */
 	TupleDesc	argdesc;		/* tupdesc for most recent input */
 } FieldStoreState;
+
+/* ----------------
+ *      CoerceViaIOState node
+ * ----------------
+ */
+typedef struct CoerceViaIOState
+{
+	ExprState	xprstate;
+	ExprState  *arg;			/* input expression */
+	FmgrInfo	outfunc;		/* lookup info for source output function */
+	FmgrInfo	infunc;			/* lookup info for result input function */
+	Oid			intypioparam;	/* argument needed for input function */
+}CoerceViaIOState;
+
+/* ---------------------
+ *	ArrayCoerceExprState node
+ *  ---------------------
+ */
+typedef struct ArrayCoerceExprState
+{
+	ExprState	xprstate;
+	ExprState  *arg;			/* input array value */
+	Oid			resultelemtype; /* element type of result array */
+	FmgrInfo	elemfunc;		/* lookup info for element coercion function */
+	/* use struct pointer to avoid including array.h here */
+	struct ArrayMapState *amstate;		/* workspace for array_map */
+} ArrayCoerceExprState;
 
 /* ----------------
  *		ConvertRowtypeExprState node
@@ -1314,6 +1368,9 @@ typedef struct PlanState
 	TupleTableSlot *ps_ResultTupleSlot; /* slot for my result tuples */
 	ExprContext *ps_ExprContext;	/* node's expression-evaluation context */
 	ProjectionInfo *ps_ProjInfo;	/* info for doing tuple projection */
+
+	/* The manager manages all the code generators and generation process */
+	void *CodegenManager;
 
 	/*
 	 * EXPLAIN ANALYZE statistics collection
@@ -1717,6 +1774,7 @@ typedef struct BitmapAppendOnlyScanState
 
 	struct AppendOnlyFetchDescData	*baos_currentAOFetchDesc;
 	struct AOCSFetchDescData *baos_currentAOCSFetchDesc;
+	struct AOCSFetchDescData *baos_currentAOCSLossyFetchDesc;
 	List	   *baos_bitmapqualorig;
 	Node  		*baos_tbm;
 	TBMIterateResult *baos_tbmres;
@@ -2139,16 +2197,8 @@ typedef struct HashJoinState
 	bool		prefetch_inner;
 	bool		hj_nonequijoin;
 
-	/* true if found matching and usable cached workfiles */
-	bool cached_workfiles_found;
-	/* set after loading nbatch and nbuckets from cached workfile */
-	bool cached_workfiles_batches_buckets_loaded;
-	/* set after loading cached workfiles */
-	bool cached_workfiles_loaded;
 	/* set if the operator created workfiles */
 	bool workfiles_created;
-	/* number of batches when we loaded from the state. -1 means not loaded yet */
-	int nbatch_loaded_state;
 } HashJoinState;
 
 
@@ -2240,8 +2290,6 @@ typedef struct SortState
 
 	void	   *share_lk_ctxt;
 
-	bool		cached_workfiles_found; /* true if found matching and usable cached workfiles */
-	bool		cached_workfiles_loaded; /* set after loading cached workfiles */
 } SortState;
 
 /* ---------------------
@@ -2301,10 +2349,6 @@ typedef struct AggState
 	bool	   *doReplace;
 	List	   *percs;			/* all PercentileExpr nodes in targetlist & quals */
 
-	/* true if found matching and usable cached workfiles */
-	bool		cached_workfiles_found;
-	/* set after loading cached workfiles */
-	bool		cached_workfiles_loaded;
 	/* set if the operator created workfiles */
 	bool		workfiles_created;
 
@@ -2367,17 +2411,6 @@ typedef struct WindowState
 
 	/* Indicate if any function need a peer count. */
 	bool		need_peercount;
-
-	/* A char buffer to temporarily hold serialized data
-	 * before writing them to the frame buffer.
-	 *
-	 * Use this pre-allocated buffer to avoid doing
-	 * palloc/pfree many times.
-	 *
-	 * The size of this array is specified by 'max_size'.
-	 */
-	char		*serial_array;
-	Size		max_size;
 } WindowState;
 
 /* ----------------
@@ -2597,7 +2630,6 @@ typedef struct PartitionSelectorState
 
 } PartitionSelectorState;
 
-extern void sendInitGpmonPkts(Plan *node, EState *estate);
 extern void initGpmonPktForResult(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForAppend(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForSequence(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
@@ -2633,11 +2665,5 @@ extern void initGpmonPktForRepeat(Plan *planNode, gpmon_packet_t *gpmon_pkt, ESt
 extern void initGpmonPktForDefunctOperators(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForDML(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForPartitionSelector(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
-/*
- * The funcion pointers to init gpmon package for each plan node.
- * The order of the function pointers are the same as the one defined in
- * NodeTag (nodes.h).
- */
-extern void (*initGpmonPktFuncs[T_Plan_End - T_Plan_Start])(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 
 #endif   /* EXECNODES_H */

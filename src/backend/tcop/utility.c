@@ -10,7 +10,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/tcop/utility.c,v 1.269.2.1 2009/12/09 21:58:29 tgl Exp $
+ *	  $PostgreSQL: pgsql/src/backend/tcop/utility.c,v 1.272 2007/02/14 01:58:57 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -63,11 +63,8 @@
 #include "utils/syscache.h"
 #include "lib/stringinfo.h"
 
-#include "cdb/cdbcat.h"
-#include "cdb/cdbdisp.h"
-#include "cdb/cdbsrlz.h"
+#include "cdb/cdbdisp_query.h"
 #include "cdb/cdbpartition.h"
-#include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"
 
 /*
@@ -509,6 +506,8 @@ check_xact_readonly(Node *parsetree)
 		case T_IndexStmt:
 		case T_CreatePLangStmt:
 		case T_CreateOpClassStmt:
+		case T_CreateOpFamilyStmt:
+		case T_AlterOpFamilyStmt:
 		case T_RuleStmt:
 		case T_CreateSchemaStmt:
 		case T_CreateSeqStmt:
@@ -525,6 +524,7 @@ check_xact_readonly(Node *parsetree)
 		case T_DropRoleStmt:
 		case T_DropPLangStmt:
 		case T_RemoveOpClassStmt:
+		case T_RemoveOpFamilyStmt:
 		case T_DropPropertyStmt:
 		case T_GrantStmt:
 		case T_GrantRoleStmt:
@@ -1180,11 +1180,12 @@ ProcessUtility(Node *parsetree,
 						break;
 					case OBJECT_OPERATOR:
 						Assert(stmt->args == NIL);
-						DefineOperator(stmt->defnames, stmt->definition, stmt->newOid);
+						DefineOperator(stmt->defnames, stmt->definition,
+									   stmt->newOid, stmt->commutatorOid, stmt->negatorOid);
 						break;
 					case OBJECT_TYPE:
 						Assert(stmt->args == NIL);
-						DefineType(stmt->defnames, stmt->definition, stmt->newOid, stmt->shadowOid);
+						DefineType(stmt->defnames, stmt->definition, stmt->newOid, stmt->arrayOid);
 						break;
 					case OBJECT_EXTPROTOCOL:
 						Assert(stmt->args == NIL);
@@ -1215,7 +1216,7 @@ ProcessUtility(Node *parsetree,
 			break;
 
 		case T_CreateFunctionStmt:		/* CREATE FUNCTION */
-			CreateFunction((CreateFunctionStmt *) parsetree);
+			CreateFunction((CreateFunctionStmt *) parsetree, queryString);
 			break;
 
 		case T_AlterFunctionStmt:		/* ALTER FUNCTION */
@@ -1294,6 +1295,10 @@ ProcessUtility(Node *parsetree,
 			}
 			break;
 
+		case T_DoStmt:
+			ExecuteDoStmt((DoStmt *) parsetree);
+			break;
+
 		case T_CreatedbStmt:
 			createdb((CreatedbStmt *) parsetree);
 			break;
@@ -1309,6 +1314,7 @@ ProcessUtility(Node *parsetree,
 		case T_DropdbStmt:
 			{
 				DropdbStmt *stmt = (DropdbStmt *) parsetree;
+
 				dropdb(stmt->dbname, stmt->missing_ok);
 			}
 			break;
@@ -1473,7 +1479,7 @@ ProcessUtility(Node *parsetree,
 
 		case T_CreateTrigStmt:
 			{
-				Oid trigOid = CreateTrigger((CreateTrigStmt *) parsetree, false);
+				Oid trigOid = CreateTrigger((CreateTrigStmt *) parsetree, InvalidOid);
 				if (Gp_role == GP_ROLE_DISPATCH)
 				{
 					((CreateTrigStmt *) parsetree)->trigOid = trigOid;
@@ -1629,8 +1635,20 @@ ProcessUtility(Node *parsetree,
 			DefineOpClass((CreateOpClassStmt *) parsetree);
 			break;
 
+		case T_CreateOpFamilyStmt:
+			DefineOpFamily((CreateOpFamilyStmt *) parsetree);
+			break;
+
+		case T_AlterOpFamilyStmt:
+			AlterOpFamily((AlterOpFamilyStmt *) parsetree);
+			break;
+
 		case T_RemoveOpClassStmt:
 			RemoveOpClass((RemoveOpClassStmt *) parsetree);
+			break;
+
+		case T_RemoveOpFamilyStmt:
+			RemoveOpFamily((RemoveOpFamilyStmt *) parsetree);
 			break;
 
 		case T_AlterTypeStmt:
@@ -2002,6 +2020,9 @@ CreateCommandTag(Node *parsetree)
 				case OBJECT_OPCLASS:
 					tag = "ALTER OPERATOR CLASS";
 					break;
+				case OBJECT_OPFAMILY:
+					tag = "ALTER OPERATOR FAMILY";
+					break;
 				case OBJECT_ROLE:
 					tag = "ALTER ROLE";
 					break;
@@ -2077,6 +2098,9 @@ CreateCommandTag(Node *parsetree)
 					break;
 				case OBJECT_OPCLASS:
 					tag = "ALTER OPERATOR CLASS";
+					break;
+				case OBJECT_OPFAMILY:
+					tag = "ALTER OPERATOR FAMILY";
 					break;
 				case OBJECT_SCHEMA:
 					tag = "ALTER SCHEMA";
@@ -2205,6 +2229,10 @@ CreateCommandTag(Node *parsetree)
 				default:
 					tag = "???";
 			}
+			break;
+
+		case T_DoStmt:
+			tag = "DO";
 			break;
 
 		case T_CreatedbStmt:
@@ -2360,8 +2388,20 @@ CreateCommandTag(Node *parsetree)
 			tag = "CREATE OPERATOR CLASS";
 			break;
 
+		case T_CreateOpFamilyStmt:
+			tag = "CREATE OPERATOR FAMILY";
+			break;
+
+		case T_AlterOpFamilyStmt:
+			tag = "ALTER OPERATOR FAMILY";
+			break;
+
 		case T_RemoveOpClassStmt:
 			tag = "DROP OPERATOR CLASS";
+			break;
+
+		case T_RemoveOpFamilyStmt:
+			tag = "DROP OPERATOR FAMILY";
 			break;
 
 		case T_PrepareStmt:
@@ -2593,6 +2633,10 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_DDL;
 			break;
 
+		case T_DoStmt:
+			lev = LOGSTMT_ALL;
+			break;
+
 		case T_CreatedbStmt:
 			lev = LOGSTMT_DDL;
 			break;
@@ -2729,7 +2773,19 @@ GetCommandLogLevel(Node *parsetree)
 			lev = LOGSTMT_DDL;
 			break;
 
+		case T_CreateOpFamilyStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
+		case T_AlterOpFamilyStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
 		case T_RemoveOpClassStmt:
+			lev = LOGSTMT_DDL;
+			break;
+
+		case T_RemoveOpFamilyStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

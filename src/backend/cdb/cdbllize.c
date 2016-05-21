@@ -35,7 +35,6 @@
 #include "cdb/cdbplan.h"
 #include "cdb/cdbpullup.h"
 #include "cdb/cdbllize.h"
-#include "cdb/cdbcat.h"
 #include "cdb/cdbmutate.h"
 #include "optimizer/tlist.h"
 
@@ -448,6 +447,12 @@ static Node *ParallelizeCorrelatedSubPlanUpdateFlowMutator(Node *node)
  * 				 	 	 \_SeqScan (no quals)
  * 	This transformed plan can be executed in a parallel setting since the correlation
  * 	is now part of the result node which executes in the same slice as the outer plan node.
+ *
+ * XXX: This relies on the planner to not generate other kinds of scans, like
+ * IndexScans. We don't have the machinery in place to rescan those with different
+ * parameters. We could support e.g. IndexScans as long as the index qual doesn't
+ * refer to the outer parameter, but the planner isn't currently smart enough to
+ * distinguish that, so we just disable index scans altogether in a subplan.
  */
 static Node* ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelatedPlanWalkerContext *ctx)
 {
@@ -476,7 +481,8 @@ static Node* ParallelizeCorrelatedSubPlanMutator(Node *node, ParallelizeCorrelat
 	if (IsA(node, SeqScan)
 		|| IsA(node, AppendOnlyScan)
 		|| IsA(node, AOCSScan)
-		|| IsA(node, ShareInputScan))
+		|| IsA(node, ShareInputScan)
+		|| IsA(node, ExternalScan))
 	{
 		Plan *scanPlan = (Plan *) node;
 		/**
@@ -939,6 +945,7 @@ pull_up_Flow(Plan *plan, Plan *subplan, bool withSort)
 	        new_flow->numSortCols = sort->numCols;
 	        ARRAYCOPY(new_flow->sortColIdx, sort->sortColIdx, sort->numCols);
 	        ARRAYCOPY(new_flow->sortOperators, sort->sortOperators, sort->numCols);
+	        ARRAYCOPY(new_flow->nullsFirst, sort->nullsFirst, sort->numCols);
         }
         else if (model_flow->numSortCols == 0)
             new_flow->numSortCols = 0;
@@ -954,10 +961,26 @@ pull_up_Flow(Plan *plan, Plan *subplan, bool withSort)
                                                      model_flow->numSortCols,
                                                      model_flow->sortColIdx,
                                                      &new_flow->sortColIdx);
+
+			/* preserve subplan sort attributes*/
+			if (new_flow->numSortCols < model_flow->numOrderbyCols)
+			{
+				new_flow->numOrderbyCols = new_flow->numSortCols;
+			}
+			else
+			{
+				new_flow->numOrderbyCols = model_flow->numOrderbyCols;
+			}
+
 		    if (new_flow->numSortCols > 0)
+			{
                 ARRAYCOPY(new_flow->sortOperators,
                           model_flow->sortOperators,
                           new_flow->numSortCols);
+                ARRAYCOPY(new_flow->nullsFirst,
+                          model_flow->nullsFirst,
+                          new_flow->numSortCols);
+			}
 	    }
 	    else
 	    {
@@ -969,6 +992,12 @@ pull_up_Flow(Plan *plan, Plan *subplan, bool withSort)
             ARRAYCOPY(new_flow->sortOperators,
                       model_flow->sortOperators,
                       new_flow->numSortCols);
+            ARRAYCOPY(new_flow->nullsFirst,
+                      model_flow->nullsFirst,
+                      new_flow->numSortCols);
+
+			/* preserve subplan sort attributes*/
+            new_flow->numOrderbyCols = model_flow->numOrderbyCols;
 	    }
 	}   /* withSort */
 
@@ -1230,6 +1259,7 @@ adjustPlanFlow(Plan        *plan,
             flow->numSortCols = 0;
             flow->sortColIdx = NULL;
             flow->sortOperators = NULL;
+			flow->nullsFirst = NULL;
         }
 
 		return true;  /* success */
@@ -1306,6 +1336,7 @@ adjustPlanFlow(Plan        *plan,
         flow->numSortCols = 0;
         flow->sortColIdx = NULL;
         flow->sortOperators = NULL;
+		flow->nullsFirst = NULL;
     }
 	
 	/* Since we added Motion, dispatch must be parallel. */

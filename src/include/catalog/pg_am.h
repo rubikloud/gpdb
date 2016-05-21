@@ -8,7 +8,7 @@
  * Portions Copyright (c) 1996-2009, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
- * $PostgreSQL: pgsql/src/include/catalog/pg_am.h,v 1.48 2007/01/05 22:19:52 momjian Exp $
+ * $PostgreSQL: pgsql/src/include/catalog/pg_am.h,v 1.50 2007/01/20 23:13:01 tgl Exp $
  *
  * NOTES
  *		the genbki.sh script reads this file and generates .bki
@@ -32,7 +32,7 @@
    amname           name, 
    amstrategies     smallint, 
    amsupport        smallint, 
-   amorderstrategy  smallint, 
+   amcanorder       boolean, 
    amcanunique      boolean, 
    amcanmulticol    boolean, 
    amoptionalkey    boolean, 
@@ -87,15 +87,13 @@
 CATALOG(pg_am,2601)
 {
 	NameData	amname;			/* access method name */
-	int2		amstrategies;	/* total NUMBER of strategies (operators) by
+	int2		amstrategies;	/* total number of strategies (operators) by
 								 * which we can traverse/search this AM.
 								 * Zero if AM does not have a fixed set of
 								 * strategy assignments. */
-	int2		amsupport;		/* total NUMBER of support functions that this
+	int2		amsupport;		/* total number of support functions that this
 								 * AM uses */
-	int2		amorderstrategy;/* if this AM has a sort order, the strategy
-								 * number of the sort operator. Zero if AM is
-								 * not ordered. */
+	bool		amcanorder;		/* does AM support ordered scan results? */
 	bool		amcanunique;	/* does AM support UNIQUE indexes? */
 	bool		amcanmulticol;	/* does AM support multi-column indexes? */
 	bool		amoptionalkey;	/* can query omit key for the first column? */
@@ -134,7 +132,7 @@ typedef FormData_pg_am *Form_pg_am;
 #define Anum_pg_am_amname				1
 #define Anum_pg_am_amstrategies			2
 #define Anum_pg_am_amsupport			3
-#define Anum_pg_am_amorderstrategy		4
+#define Anum_pg_am_amcanorder			4
 #define Anum_pg_am_amcanunique			5
 #define Anum_pg_am_amcanmulticol		6
 #define Anum_pg_am_amoptionalkey		7
@@ -161,19 +159,19 @@ typedef FormData_pg_am *Form_pg_am;
  * ----------------
  */
 
-DATA(insert OID = 403 (  btree	5 1 1 t t t t f t t btinsert btbeginscan btgettuple btgetmulti btrescan btendscan btmarkpos btrestrpos btbuild btbulkdelete btvacuumcleanup btcostestimate btoptions ));
+DATA(insert OID = 403 (  btree	5 1 t t t t t f t t btinsert btbeginscan btgettuple btgetmulti btrescan btendscan btmarkpos btrestrpos btbuild btbulkdelete btvacuumcleanup btcostestimate btoptions ));
 DESCR("b-tree index access method");
 #define BTREE_AM_OID 403
-DATA(insert OID = 405 (  hash	1 1 0 f f f f f f t hashinsert hashbeginscan hashgettuple hashgetmulti hashrescan hashendscan hashmarkpos hashrestrpos hashbuild hashbulkdelete hashvacuumcleanup hashcostestimate hashoptions ));
+DATA(insert OID = 405 (  hash	1 1 f f f f f f f t hashinsert hashbeginscan hashgettuple hashgetmulti hashrescan hashendscan hashmarkpos hashrestrpos hashbuild hashbulkdelete hashvacuumcleanup hashcostestimate hashoptions ));
 DESCR("hash index access method");
 #define HASH_AM_OID 405
-DATA(insert OID = 783 (  gist	0 7 0 f t t t t t t gistinsert gistbeginscan gistgettuple gistgetmulti gistrescan gistendscan gistmarkpos gistrestrpos gistbuild gistbulkdelete gistvacuumcleanup gistcostestimate gistoptions ));
+DATA(insert OID = 783 (  gist	0 7 f f t t t t t t gistinsert gistbeginscan gistgettuple gistgetmulti gistrescan gistendscan gistmarkpos gistrestrpos gistbuild gistbulkdelete gistvacuumcleanup gistcostestimate gistoptions ));
 DESCR("GiST index access method");
 #define GIST_AM_OID 783
-DATA(insert OID = 2742 (  gin	0 4 0 f f f f t f t gininsert ginbeginscan gingettuple gingetmulti ginrescan ginendscan ginmarkpos ginrestrpos ginbuild ginbulkdelete ginvacuumcleanup gincostestimate ginoptions ));
+DATA(insert OID = 2742 (  gin	0 4 f f f f f t f t gininsert ginbeginscan gingettuple gingetmulti ginrescan ginendscan ginmarkpos ginrestrpos ginbuild ginbulkdelete ginvacuumcleanup gincostestimate ginoptions ));
 DESCR("GIN index access method");
 #define GIN_AM_OID 2742
-DATA(insert OID = 3013 (  bitmap	5 1 0 f t t t f f f bminsert bmbeginscan bmgettuple bmgetmulti bmrescan bmendscan bmmarkpos bmrestrpos bmbuild bmbulkdelete bmvacuumcleanup bmcostestimate bmoptions ));
+DATA(insert OID = 3013 (  bitmap	5 1 f f t t t f f f bminsert bmbeginscan bmgettuple bmgetmulti bmrescan bmendscan bmmarkpos bmrestrpos bmbuild bmbulkdelete bmvacuumcleanup bmcostestimate bmoptions ));
 DESCR("bitmap index access method");
 #define BITMAP_AM_OID 3013
 
@@ -181,7 +179,7 @@ DESCR("bitmap index access method");
  * Am_btree AM values for FormData_pg_am.
  */
 #define Am_btree \
-  {"btree"}, 5, 1, 1, true, true, true, true, false, true, true, BTINSERT_OID, BTBEGINSCAN_OID, BTGETTUPLE_OID, BTGETMULTI_OID, BTRESCAN_OID, BTENDSCAN_OID, BTMARKPOS_OID, BTRESTRPOS_OID, BTBUILD_OID, BTBULKDELETE_OID, BTVACUUMCLEANUP_OID, BTCOSTESTIMATE_OID, BTOPTIONS_OID
+	{"btree"}, 5, 1, true, true, true, true, true, false, true, true, BTINSERT_OID, BTBEGINSCAN_OID, BTGETTUPLE_OID, BTGETMULTI_OID, BTRESCAN_OID, BTENDSCAN_OID, BTMARKPOS_OID, BTRESTRPOS_OID, BTBUILD_OID, BTBULKDELETE_OID, BTVACUUMCLEANUP_OID, BTCOSTESTIMATE_OID, BTOPTIONS_OID
 
 
 #endif   /* PG_AM_H */

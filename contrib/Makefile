@@ -1,4 +1,4 @@
-# $PostgreSQL: pgsql/contrib/Makefile,v 1.70 2006/09/09 04:07:51 tgl Exp $
+# $PostgreSQL: pgsql/contrib/Makefile,v 1.71 2007/02/08 15:09:47 momjian Exp $
 
 subdir = contrib
 top_builddir = ..

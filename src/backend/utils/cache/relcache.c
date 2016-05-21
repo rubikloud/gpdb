@@ -9,7 +9,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/utils/cache/relcache.c,v 1.253 2007/01/05 22:19:43 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/utils/cache/relcache.c,v 1.259 2007/03/29 00:15:38 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -73,7 +73,7 @@
 #include "utils/syscache.h"
 #include "utils/typcache.h"
 
-#include "cdb/cdbcat.h"         /* GpPolicy */
+#include "catalog/gp_policy.h"         /* GpPolicy */
 #include "cdb/cdbtm.h"
 #include "cdb/cdbvars.h"        /* Gp_role */
 #include "cdb/cdbmirroredflatfile.h"
@@ -356,11 +356,8 @@ GpRelationNodeBeginScan(
 HeapTuple
 GpRelationNodeGetNext(
 	GpRelationNodeScan 	*gpRelationNodeScan,
-
 	int32				*segmentFileNum,
-
 	ItemPointer			persistentTid,
-
 	int64				*persistentSerialNum)
 {
 	HeapTuple tuple;
@@ -394,7 +391,8 @@ GpRelationNodeGetNext(
 						persistentTid,
 						persistentSerialNum);
 	if (actualRelationNode != gpRelationNodeScan->relfilenode)
-		elog(FATAL, "Mismatch in node tuple for gp_relation_node for relation %u, relfilenode %u, relation node %u",
+		elog(FATAL, "Index on gp_relation_node broken."
+			   "Mismatch in node tuple for gp_relation_node for relation %u, relfilenode %u, relation node %u",
 			 gpRelationNodeScan->relationId, 
 			 gpRelationNodeScan->relfilenode,
 			 actualRelationNode);
@@ -411,8 +409,7 @@ GpRelationNodeEndScan(
 	systable_endscan((SysScanDesc)gpRelationNodeScan->scan);
 }
 
-
-HeapTuple
+static HeapTuple
 ScanGpRelationNodeTuple(
 	Relation 	gp_relation_node,
 	Oid 		relfilenode,
@@ -516,8 +513,15 @@ FetchGpRelationNodeTuple(
 						&createMirrorDataLossTrackingSessionNum,
 						persistentTid,
 						persistentSerialNum);
-	Assert (actualRelationNode == relfilenode);
 	
+	if (actualRelationNode != relfilenode)
+	{
+		elog(ERROR, "Index on gp_relation_node broken."
+			   "Mismatch in node tuple for gp_relation_node intended relfilenode %u, fetched relfilenode %u",
+			 relfilenode,
+			 actualRelationNode);
+	}
+
 	return tuple;
 }
 
@@ -532,21 +536,24 @@ DeleteGpRelationNodeTuple(
 {
 	Relation	gp_relation_node;
 	HeapTuple	tuple;
+	ItemPointerData     persistentTid;
+	int64               persistentSerialNum;
 
-	/* Grab an appropriate lock on the pg_class relation */
 	gp_relation_node = heap_open(GpRelationNodeRelationId, RowExclusiveLock);
 
-	tuple = ScanGpRelationNodeTuple(
-						gp_relation_node,
-						relation->rd_rel->relfilenode,
-						segmentFileNum);
+	tuple = FetchGpRelationNodeTuple(gp_relation_node,
+				relation->rd_rel->relfilenode,
+				segmentFileNum,
+				&persistentTid,
+				&persistentSerialNum);
+
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "could not find node tuple for relation %u, relation file node %u, segment file #%d",
 			 RelationGetRelid(relation),
 			 relation->rd_rel->relfilenode,
 			 segmentFileNum);
 
-	/* delete the relation tuple from pg_class, and finish up */
+	/* delete the relation tuple from gp_relation_node, and finish up */
 	simple_heap_delete(gp_relation_node, &tuple->t_self);
 	heap_freetuple(tuple);
 
@@ -1284,6 +1291,7 @@ RelationBuildDesc(Oid targetRelId, bool insertIt)
 	relation->rd_refcnt = 0;
 	relation->rd_isnailed = false;
 	relation->rd_createSubid = InvalidSubTransactionId;
+	relation->rd_newRelfilenodeSubid = InvalidSubTransactionId;
 	relation->rd_istemp = isTempNamespace(relation->rd_rel->relnamespace);
 	relation->rd_issyscat = (strncmp(relation->rd_rel->relname.data, "pg_", 3) == 0);
 
@@ -1394,8 +1402,10 @@ RelationInitIndexAccessInfo(Relation relation)
 	HeapTuple	tuple;
 	Form_pg_am	aform;
 	Datum		indclassDatum;
+	Datum		indoptionDatum;
 	bool		isnull;
 	oidvector  *indclass;
+	int2vector  *indoption;
 	MemoryContext indexcxt;
 	MemoryContext oldcontext;
 	int			natts;
@@ -1488,6 +1498,9 @@ RelationInitIndexAccessInfo(Relation relation)
 		relation->rd_supportinfo = NULL;
 	}
 
+	relation->rd_indoption = (int16 *)
+		MemoryContextAllocZero(indexcxt, natts * sizeof(int16));
+
 	/*
 	 * indclass cannot be referenced directly through the C struct, because it
 	 * comes after the variable-width indkey field.  Must extract the
@@ -1509,6 +1522,17 @@ RelationInitIndexAccessInfo(Relation relation)
 						   relation->rd_operator, relation->rd_support,
 						   relation->rd_opfamily, relation->rd_opcintype,
 						   amstrategies, amsupport, natts);
+
+	/*
+	 * Similarly extract indoption and copy it to the cache entry
+	 */
+	indoptionDatum = fastgetattr(relation->rd_indextuple,
+								 Anum_pg_index_indoption,
+								 GetPgIndexDescriptor(),
+								 &isnull);
+	Assert(!isnull);
+	indoption = (int2vector *) DatumGetPointer(indoptionDatum);
+	memcpy(relation->rd_indoption, indoption->values, natts * sizeof(int16));
 
 	/*
 	 * expressions and predicate cache will be filled later
@@ -1820,6 +1844,7 @@ formrdesc(const char *relationName, Oid relationReltype,
 	 */
 	relation->rd_isnailed = true;
 	relation->rd_createSubid = InvalidSubTransactionId;
+	relation->rd_newRelfilenodeSubid = InvalidSubTransactionId;
 	relation->rd_istemp = false;
 	relation->rd_issyscat = (strncmp(relationName, "pg_", 3) == 0);	/* GP */
     relation->rd_isLocalBuf = false;    /*CDB*/
@@ -2064,7 +2089,8 @@ RelationClose(Relation relation)
 
 #ifdef RELCACHE_FORCE_RELEASE
 	if (RelationHasReferenceCountZero(relation) &&
-		relation->rd_createSubid == InvalidSubTransactionId)
+		relation->rd_createSubid == InvalidSubTransactionId &&
+		relation->rd_newRelfilenodeSubid == InvalidSubTransactionId)
 		RelationClearRelation(relation, false);
 #endif
 }
@@ -2386,9 +2412,6 @@ RelationClearRelation(Relation relation, bool rebuild)
 		/* pgstat_info must be preserved */
 		SWAPFIELD(struct PgStat_TableStatus *, pgstat_info);
 
-		/* preserve rd_cdbpolicy, as there are probably pointers to it */
-		SWAPFIELD(struct GpPolicy *, rd_cdbpolicy);
-
 		/* preserve persistent table information for the relation  */
 		SWAPFIELD(struct RelationNodeInfo, rd_segfile0_relationnodeinfo);
 
@@ -2409,12 +2432,13 @@ RelationFlushRelation(Relation relation)
 {
 	bool		rebuild;
 
-	if (relation->rd_createSubid != InvalidSubTransactionId)
+	if (relation->rd_createSubid != InvalidSubTransactionId ||
+		relation->rd_newRelfilenodeSubid != InvalidSubTransactionId)
 	{
 		/*
 		 * New relcache entries are always rebuilt, not flushed; else we'd
 		 * forget the "new" status of the relation, which is a useful
-		 * optimization to have.
+		 * optimization to have.  Ditto for the new-relfilenode status.
 		 */
 		rebuild = true;
 	}
@@ -2491,6 +2515,12 @@ RelationCacheInvalidateEntry(Oid relationId)
  *	 so we do not touch new-in-transaction relations; they cannot be targets
  *	 of cross-backend SI updates (and our own updates now go through a
  *	 separate linked list that isn't limited by the SI message buffer size).
+ *	 Likewise, we need not discard new-relfilenode-in-transaction hints,
+ *	 since any invalidation of those would be a local event.
+ *
+ *	 We don't do anything special for newRelfilenode-in-transaction relations, 
+ *	 though since we have a lock on the relation nobody else should be 
+ *	 generating cache invalidation messages for it anyhow.
  *
  *	 We do this in two phases: the first pass deletes deletable items, and
  *	 the second one rebuilds the rebuildable items.  This is essential for
@@ -2612,9 +2642,10 @@ AtEOXact_RelationCache(bool isCommit)
 	 * the debug-only Assert checks, most transactions don't create any work
 	 * for us to do here, so we keep a static flag that gets set if there is
 	 * anything to do.	(Currently, this means either a relation is created in
-	 * the current xact, or an index list is forced.)  For simplicity, the
-	 * flag remains set till end of top-level transaction, even though we
-	 * could clear it at subtransaction end in some cases.
+	 * the current xact, or one is given a new relfilenode, or an index list
+	 * is forced.)  For simplicity, the flag remains set till end of top-level
+	 * transaction, even though we could clear it at subtransaction end in
+	 * some cases.
 	 *
 	 * MPP-3333: READERS need to *always* scan, otherwise they will not be able
 	 * to maintain a coherent view of the storage layer.
@@ -2689,6 +2720,11 @@ AtEOXact_RelationCache(bool isCommit)
 				continue;
 			}
 		}
+
+		/*
+		 * Likewise, reset the hint about the relfilenode being new.
+		 */
+		relation->rd_newRelfilenodeSubid = InvalidSubTransactionId;
 
 		/*
 		 * Flush any temporary index list.
@@ -2766,6 +2802,17 @@ AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
 		}
 
 		/*
+		 * Likewise, update or drop any new-relfilenode-in-subtransaction hint.
+		 */
+		if (relation->rd_newRelfilenodeSubid == mySubid)
+		{
+			if (isCommit)
+				relation->rd_newRelfilenodeSubid = parentSubid;
+			else
+			 relation->rd_newRelfilenodeSubid = InvalidSubTransactionId;
+		}
+
+		/*
 		 * Flush any temporary index list.
 		 */
 		if (relation->rd_indexvalid == 2)
@@ -2777,6 +2824,23 @@ AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
 		}
 	}
 }
+
+/*
+ * RelationCacheMarkNewRelfilenode
+ *
+ *	Mark the rel as having been given a new relfilenode in the current
+ *	(sub) transaction.  This is a hint that can be used to optimize
+ *	later operations on the rel in the same transaction.
+ */
+void
+RelationCacheMarkNewRelfilenode(Relation rel)
+{
+	/* Mark it... */
+	rel->rd_newRelfilenodeSubid = GetCurrentSubTransactionId();
+	/* ... and now we have eoxact cleanup work to do */
+	need_eoxact_work = true;
+}
+
 
 /*
  *		RelationBuildLocalRelation
@@ -2858,6 +2922,7 @@ RelationBuildLocalRelation(const char *relname,
 
 	/* it's being created in this transaction */
 	rel->rd_createSubid = GetCurrentSubTransactionId();
+	rel->rd_newRelfilenodeSubid = InvalidSubTransactionId;
 
 	/* must flag that we have rels created in this transaction */
 	need_eoxact_work = true;
@@ -3529,8 +3594,9 @@ CheckConstraintFetch(Relation relation)
 			continue;
 
 		if (found >= ncheck)
-			elog(ERROR, "unexpected constraint record found for rel %s",
-				 RelationGetRelationName(relation));
+			elog(ERROR,
+			     "pg_class reports %d constraint record(s) for rel %s, but found extra in pg_constraint",
+			     ncheck, RelationGetRelationName(relation));
 
 		check[found].ccname = MemoryContextStrdup(CacheMemoryContext,
 												  NameStr(conform->conname));
@@ -3552,8 +3618,9 @@ CheckConstraintFetch(Relation relation)
 	heap_close(conrel, AccessShareLock);
 
 	if (found != ncheck)
-		elog(ERROR, "%d constraint record(s) missing for rel %s",
-			 ncheck - found, RelationGetRelationName(relation));
+		elog(ERROR,
+		     "found %d in pg_constraint, but pg_class reports %d constraint record(s) for rel %s",
+		     found, ncheck, RelationGetRelationName(relation));
 }
 
 
@@ -4090,6 +4157,7 @@ load_relcache_init_file(bool shared)
 			Oid		   *operator;
 			RegProcedure *support;
 			int			nsupport;
+			int16	   *indoption;
 
 			/* Count nailed indexes to ensure we have 'em all */
 			if (rel->rd_isnailed)
@@ -4157,7 +4225,7 @@ load_relcache_init_file(bool shared)
 
 			rel->rd_operator = operator;
 
-			/* finally, read the vector of support procedures */
+			/* next, read the vector of support procedures */
 			if ((nread = fread(&len, 1, sizeof(len), fp)) != sizeof(len))
 				goto read_failed;
 			support = (RegProcedure *) MemoryContextAlloc(indexcxt, len);
@@ -4165,6 +4233,16 @@ load_relcache_init_file(bool shared)
 				goto read_failed;
 
 			rel->rd_support = support;
+
+			/* finally, read the vector of indoption values */
+			if ((nread = fread(&len, 1, sizeof(len), fp)) != sizeof(len))
+				goto read_failed;
+
+			indoption = (int16 *) MemoryContextAlloc(indexcxt, len);
+			if ((nread = fread(indoption, 1, len, fp)) != len)
+				goto read_failed;
+
+			rel->rd_indoption = indoption;
 
 			/* set up zeroed fmgr-info vectors */
 			rel->rd_aminfo = (RelationAmInfo *)
@@ -4189,6 +4267,7 @@ load_relcache_init_file(bool shared)
 			Assert(rel->rd_operator == NULL);
 			Assert(rel->rd_support == NULL);
 			Assert(rel->rd_supportinfo == NULL);
+			Assert(rel->rd_indoption == NULL);
 		}
 
 		/*
@@ -4217,6 +4296,7 @@ load_relcache_init_file(bool shared)
 		rel->rd_indexlist = NIL;
 		rel->rd_oidindex = InvalidOid;
 		rel->rd_createSubid = InvalidSubTransactionId;
+		rel->rd_newRelfilenodeSubid = InvalidSubTransactionId;
 		rel->rd_amcache = NULL;
 		MemSet(&rel->pgstat_info, 0, sizeof(rel->pgstat_info));
         rel->rd_cdbpolicy = NULL;
@@ -4408,9 +4488,14 @@ write_relcache_init_file(bool shared)
 					   relform->relnatts * (am->amstrategies * sizeof(Oid)),
 					   fp);
 
-			/* finally, write the vector of support procedures */
+			/* next, write the vector of support procedures */
 			write_item(rel->rd_support,
 				  relform->relnatts * (am->amsupport * sizeof(RegProcedure)),
+					   fp);
+
+			/* finally, write the vector of indoption values */
+			write_item(rel->rd_indoption,
+					   relform->relnatts * sizeof(int16),
 					   fp);
 		}
 

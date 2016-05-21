@@ -51,7 +51,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/access/common/heaptuple.c,v 1.113 2007/01/05 22:19:21 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/access/common/heaptuple.c,v 1.115 2007/02/09 03:35:33 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -1105,8 +1105,8 @@ heap_deformtuple(HeapTuple tuple,
 				 Datum *values,
 				 char *nulls)
 {
-	int i;
-	bool *isnull = (bool *) palloc(tupleDesc->natts * sizeof(bool));
+	int			i;
+	bool	   *isnull = (bool *) palloc(tupleDesc->natts * sizeof(bool));
 
 	heap_deform_tuple(tuple, tupleDesc, values, isnull);
 
@@ -1242,7 +1242,6 @@ _slot_getsomeattrs(TupleTableSlot *slot, int attnum)
 	attno = Min(attno, attnum);
 
 	slot_deform_tuple(slot, attno);
-
 
 	/*
 	 * If tuple doesn't have all the atts indicated by tupleDesc, read the

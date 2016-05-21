@@ -249,6 +249,8 @@ typedef enum FaultInjectorType_e {
 	
 	FaultInjectorTypeInterrupt,
 
+	FaultInjectorTypeFinishPending,
+
 	FaultInjectorTypeCheckpointAndPanic,
 
 	/* INSERT has to be done before that line */
@@ -351,8 +353,8 @@ extern void FaultInjector_ShmemInit(void);
 extern FaultInjectorType_e FaultInjector_InjectFaultIfSet(
 							   FaultInjectorIdentifier_e identifier,
 							   DDLStatement_e			 ddlStatement,
-							   char*					 databaseName,
-							   char*					 tableName);
+							   const char*				 databaseName,
+							   const char*				 tableName);
 
 extern int FaultInjector_SetFaultInjection(
 							FaultInjectorEntry_s	*entry);

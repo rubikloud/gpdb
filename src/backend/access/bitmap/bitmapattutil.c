@@ -58,10 +58,12 @@ _bitmap_create_lov_heapandindex(Relation rel,
 	IndexInfo  *indexInfo;
 	ObjectAddress	objAddr, referenced;
 	Oid		   *classObjectId;
+	int16	   *coloptions;
 	Oid			heapid;
 	Oid			idxid;
 	int			indattrs;
 	int			i;
+	Oid			unusedArrayOid = InvalidOid;
 
 	Assert(rel != NULL);
 
@@ -165,6 +167,7 @@ _bitmap_create_lov_heapandindex(Relation rel,
 								 (Datum)0, true,
 								 /* valid_opts */ true,
 								 &lovComptypeOid,
+								 &unusedArrayOid,
 						 		 /* persistentTid */ NULL,
 						 		 /* persistentSerialNum */ NULL);
 	Assert(heapid == *lovHeapOid);
@@ -200,18 +203,20 @@ _bitmap_create_lov_heapandindex(Relation rel,
 	indexInfo->opaque = NULL;
 
 	classObjectId = (Oid *) palloc(indattrs * sizeof(Oid));
+	coloptions = (int16 *) palloc(indattrs * sizeof(int16));
 	for (i = 0; i < indattrs; i++)
 	{
 		Oid typid = tupDesc->attrs[i]->atttypid;
 
 		indexInfo->ii_KeyAttrNumbers[i] = i + 1;
 		classObjectId[i] = GetDefaultOpClass(typid, BTREE_AM_OID);
+		coloptions[i] = 0;
 	}
 
 	idxid = index_create(*lovHeapOid, lovIndexName, *lovIndexOid,
 						 indexInfo, BTREE_AM_OID,
 						 rel->rd_rel->reltablespace,
-						 classObjectId, 0, false, false, (Oid *) NULL, true,
+						 classObjectId, coloptions, 0, false, false, (Oid *) NULL, true,
 						 false, false, NULL);
 	Assert(idxid == *lovIndexOid);
 }

@@ -8,7 +8,7 @@
  *
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/parser/parse_expr.c,v 1.204 2007/01/05 22:19:34 momjian Exp $
+ *	  $PostgreSQL: pgsql/src/backend/parser/parse_expr.c,v 1.211 2007/02/11 22:18:15 petere Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -21,6 +21,7 @@
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "optimizer/clauses.h"
 #include "optimizer/var.h"
@@ -56,7 +57,8 @@ static Node *transformAExprOf(ParseState *pstate, A_Expr *a);
 static Node *transformAExprIn(ParseState *pstate, A_Expr *a);
 static Node *transformFuncCall(ParseState *pstate, FuncCall *fn);
 static Node *transformSubLink(ParseState *pstate, SubLink *sublink);
-static Node *transformArrayExpr(ParseState *pstate, ArrayExpr *a);
+static Node *transformArrayExpr(ParseState *pstate, A_ArrayExpr *a,
+                                  Oid array_type, Oid element_type, int32 typmod);
 static Node *transformRowExpr(ParseState *pstate, RowExpr *r);
 static Node *transformTableValueExpr(ParseState *pstate, TableValueExpr *t);
 static Node *transformCoalesceExpr(ParseState *pstate, CoalesceExpr *c);
@@ -73,7 +75,7 @@ static Node *transformIndirection(ParseState *pstate, Node *basenode,
 static Node *transformGroupingFunc(ParseState *pstate, GroupingFunc *gf);
 static Node *transformPercentileExpr(ParseState *pstate, PercentileExpr *p);
 static Node *typecast_expression(ParseState *pstate, Node *expr,
-					TypeName *typname);
+					TypeName *typename);
 static Node *make_row_comparison_op(ParseState *pstate, List *opname,
 					   List *largs, List *rargs, int location);
 static Node *make_row_distinct_op(ParseState *pstate, List *opname,
@@ -164,11 +166,54 @@ transformExpr(ParseState *pstate, Node *expr)
 				break;
 			}
 
+        case T_A_ArrayExpr:
+            result = transformArrayExpr(pstate, (A_ArrayExpr *) expr,
+                                        InvalidOid, InvalidOid, -1);
+            break;
+
 		case T_TypeCast:
 			{
 				TypeCast   *tc = (TypeCast *) expr;
-				Node	   *arg = transformExpr(pstate, tc->arg);
+				Node	   *arg = NULL;
 
+				/*
+				* If the subject of the typecast is an ARRAY[] construct
+				* and the target type is an array type, we invoke
+				* transformArrayExpr() directly so that we can pass down
+				* the type information. This avoids some cases where
+				* transformArrayExpr() might not infer the correct type
+				*/
+				if (IsA(tc->arg, A_ArrayExpr))
+				{
+					Oid	targetType;
+					Oid	elementType;
+					int32	targetTypmod;
+
+					targetType = typenameTypeId(pstate, tc->typname);
+					targetTypmod = typenameTypeMod(pstate, tc->typname, targetType);
+
+					elementType = get_element_type(targetType);
+					if (OidIsValid(elementType))
+					{
+						/*
+						 * tranformArrayExpr doesn't know how to check domain
+						 * constraints, so ask it to return the base type
+						 * instead. transformTypeCast below will cast it to
+						 * the domain. In the usual case that the target is
+						 * not a domain, transformTypeCast is a no-op.
+						 */
+						targetType = getBaseTypeAndTypmod(targetType,
+														 &targetTypmod);
+						tc = copyObject(tc);
+						tc->arg = transformArrayExpr(pstate,
+													 (A_ArrayExpr *) tc->arg,
+													 targetType,
+													 elementType,
+													 targetTypmod);
+					}
+				}
+
+				arg = transformExpr(pstate, tc->arg);
 				result = typecast_expression(pstate, arg, tc->typname);
 				break;
 			}
@@ -226,10 +271,6 @@ transformExpr(ParseState *pstate, Node *expr)
 
 		case T_CaseExpr:
 			result = transformCaseExpr(pstate, (CaseExpr *) expr);
-			break;
-
-		case T_ArrayExpr:
-			result = transformArrayExpr(pstate, (ArrayExpr *) expr);
 			break;
 
 		case T_RowExpr:
@@ -390,8 +431,11 @@ transformExpr(ParseState *pstate, Node *expr)
 		case T_FieldSelect:
 		case T_FieldStore:
 		case T_RelabelType:
+		case T_ArrayCoerceExpr:
+		case T_CoerceViaIO:
 		case T_ConvertRowtypeExpr:
 		case T_CaseTestExpr:
+		case T_ArrayExpr:
 		case T_CoerceToDomain:
 		case T_CoerceToDomainValue:
 		case T_SetToDefault:
@@ -635,7 +679,7 @@ transformIndirection(ParseState *pstate, Node *basenode, List *indirection)
 			result = ParseFuncOrColumn(pstate,
 									   list_make1(n),
 									   list_make1(result),
-                                       NIL, false, false, true,
+                                       NIL, false, false, false, true,
                                        NULL, -1, NULL);
 		}
 	}
@@ -769,7 +813,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 					node = ParseFuncOrColumn(pstate,
 											 list_make1(makeString(name2)),
 											 list_make1(node),
-											 NIL, false, false, true, NULL,
+											 NIL, false, false, false, true, NULL,
 											 cref->location, NULL);
 				}
 				break;
@@ -799,7 +843,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 					node = ParseFuncOrColumn(pstate,
 											 list_make1(makeString(name3)),
 											 list_make1(node),
-											 NIL, false, false, true, NULL,
+											 NIL, false, false, false, true, NULL,
 											 cref->location, NULL);
 				}
 				break;
@@ -840,7 +884,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 					node = ParseFuncOrColumn(pstate,
 											 list_make1(makeString(name4)),
 											 list_make1(node),
-											 NIL, false, false, true, NULL,
+											 NIL, false, false, false, true, NULL,
 											 cref->location, NULL);
 				}
 				break;
@@ -1236,6 +1280,7 @@ transformAExprIn(ParseState *pstate, A_Expr *a)
 			newa->element_typeid = scalar_type;
 			newa->elements = aexprs;
 			newa->multidims = false;
+			newa->location = -1;
 
 			return (Node *) make_scalar_array_op(pstate,
 												 a->name,
@@ -1293,17 +1338,13 @@ transformFuncCall(ParseState *pstate, FuncCall *fn)
 	ListCell   *args;
 
 	/*
-	 * Transform the list of arguments.  We use a shallow list copy and then
-	 * transform-in-place to avoid O(N^2) behavior from repeated lappend's.
-	 *
-	 * XXX: repeated lappend() would no longer result in O(n^2) behavior;
-	 * worth reconsidering this design?
+	 * Transform the list of arguments.
 	 */
-	targs = list_copy(fn->args);
-	foreach(args, targs)
+	targs = NIL;
+	foreach(args, fn->args)
 	{
-		lfirst(args) = transformExpr(pstate,
-									 (Node *) lfirst(args));
+		targs = lappend(targs, transformExpr(pstate,
+											 (Node *) lfirst(args)));
 	}
 
 	/* CDB: Drop a breadcrumb in case of error. */
@@ -1315,6 +1356,7 @@ transformFuncCall(ParseState *pstate, FuncCall *fn)
                              fn->agg_order,
 							 fn->agg_star,
 							 fn->agg_distinct,
+							 fn->func_variadic,
 							 false,
 							 (WindowSpec *)fn->over,
 							 fn->location, 
@@ -1625,64 +1667,153 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 }
 
 static Node *
-transformArrayExpr(ParseState *pstate, ArrayExpr *a)
+transformArrayExpr(ParseState *pstate, A_ArrayExpr *a,
+                   Oid array_type, Oid element_type, int32 typmod)
 {
 	ArrayExpr  *newa = makeNode(ArrayExpr);
 	List	   *newelems = NIL;
 	List	   *newcoercedelems = NIL;
 	List	   *typeids = NIL;
 	ListCell   *element;
-	Oid			array_type;
-	Oid			element_type;
+	Oid			coerce_type;
+	bool		coerce_hard;
 
-	/* Transform the element expressions */
+	/*
+	 * Transform the element expressions
+	 *
+	 * Assume that the array is one-dimensional unless we find an array-type
+	 * element expression.
+	 */
+    newa->multidims = false;
 	foreach(element, a->elements)
 	{
 		Node	   *e = (Node *) lfirst(element);
 		Node	   *newe;
+		Oid			newe_type;
 
-		newe = transformExpr(pstate, e);
+		/*
+		 * If an element is itself an A_ArrayExpr, resurse directly so that
+		 * we can pass down any target type we were given.
+		 */
+		if (IsA(e, A_ArrayExpr))
+		{
+			newe = transformArrayExpr(pstate,
+									 (A_ArrayExpr *) e,
+									 array_type,
+									 element_type,
+									 typmod);
+			newe_type = exprType(newe);
+			/* we certainly have an array here */
+			Assert(array_type == InvalidOid || array_type == newe_type);
+			newa->multidims = true;
+		}
+		else
+		{
+			newe = transformExpr(pstate, e);
+			newe_type = exprType(newe);
+			/*
+			 * Check for sub-array expressions, if we haven't already
+			 * found one.
+			 */
+			if (!newa->multidims && is_array_type(newe_type))
+				newa->multidims = true;
+		}
+
 		newelems = lappend(newelems, newe);
-		typeids = lappend_oid(typeids, exprType(newe));
+		typeids = lappend_oid(typeids, newe_type);
 	}
 
 	/* CDB: Drop a breadcrumb in case of error. */
 	pstate->p_breadcrumb.node = (Node *)a;
 
-	/* Select a common type for the elements */
-	element_type = select_common_type(typeids, "ARRAY");
+	/*
+	 * Select a target type for the elements.
+	 *
+	 * If we haven't been given a target array type, we must try to deduce a
+	 * common type based on the types of the individual elements present.
+	 */
+	if (OidIsValid(array_type))
+	{
+		/* Caller must ensure array_type matches element_type */
+		Assert(OidIsValid(element_type));
+		coerce_type = (newa->multidims ? array_type : element_type);
+		coerce_hard = true;
+	}
+	else
+	{
+		/* Can't handle an empty array without a target type */
+		if (typeids == NIL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDETERMINATE_DATATYPE),
+					 errmsg("cannot determine type of empty array"),
+					 errhint("Explicitly cast to the desired type, "
+							"for example ARRAY[]::integer[].")));
 
-	/* Coerce arguments to common type if necessary */
+		/* Select a common type for the elements */
+		coerce_type = select_common_type(typeids, "ARRAY");
+
+		if (newa->multidims)
+		{
+			array_type = coerce_type;
+			element_type = get_element_type(array_type);
+			if (!OidIsValid(element_type))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("could not find element type for data type %s",
+								format_type_be(array_type))));
+		}
+		else
+		{
+			element_type = coerce_type;
+			array_type = get_array_type(element_type);
+			if (!OidIsValid(array_type))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("could not find array type for data type %s",
+								format_type_be(element_type))));
+
+		}
+		coerce_hard = false;
+	}
+
+	/*
+	 * Coerce elements to target type
+	 *
+	 * If the array has been explicitly cast, then the elements are in turn
+	 * explicitly coerced.
+	 *
+	 * If the array's type was merely derived from the common type of its
+	 * elements, then the elements are implicitly coerced to the common type.
+	 * This is consistent with other uses of select_common_type().
+	 */
+
 	foreach(element, newelems)
 	{
 		Node	   *e = (Node *) lfirst(element);
 		Node	   *newe;
 
-		newe = coerce_to_common_type(pstate, e,
-									 element_type,
-									 "ARRAY");
+		if (coerce_hard)
+		{
+			newe = coerce_to_target_type(pstate, e,
+										 exprType(e),
+										 coerce_type,
+										 typmod,
+										 COERCION_EXPLICIT,
+										 COERCE_EXPLICIT_CAST,-1);
+		
+			if (newe == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_CANNOT_COERCE),
+						 errmsg("cannot cast type %s to %s",
+								format_type_be(exprType(e)),
+								format_type_be(coerce_type)),
+						 parser_errposition(pstate, exprLocation(e))));
+		}
+		else
+			newe = coerce_to_common_type(pstate, e,
+										 coerce_type,
+										 "ARRAY");
 		newcoercedelems = lappend(newcoercedelems, newe);
-	}
-
-	/* Do we have an array type to use? */
-	array_type = get_array_type(element_type);
-	if (array_type != InvalidOid)
-	{
-		/* Elements are presumably of scalar type */
-		newa->multidims = false;
-	}
-	else
-	{
-		/* Must be nested array expressions */
-		newa->multidims = true;
-
-		array_type = element_type;
-		element_type = get_element_type(array_type);
-		if (!OidIsValid(element_type))
-			ereport(ERROR,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("could not find array type for data type %s",
-							format_type_be(array_type))));
 	}
 
 	newa->array_typeid = array_type;
@@ -2438,7 +2569,8 @@ transformPercentileExpr(ParseState *pstate, PercentileExpr *p)
 			 */
 			sortlist = addTargetToSortList(pstate, tle,
 										   sortlist, tlist,
-										   sortby->sortby_kind,
+										   sortby->sortby_dir,
+										   sortby->sortby_nulls,
 										   sortby->useOp,
 										   true);
 
@@ -2607,6 +2739,12 @@ exprType(Node *expr)
 		case T_RelabelType:
 			type = ((RelabelType *) expr)->resulttype;
 			break;
+		case T_CoerceViaIO:
+			type = ((CoerceViaIO *) expr)->resulttype;
+			break;
+		case T_ArrayCoerceExpr:
+			type = ((ArrayCoerceExpr *) expr)->resulttype;
+			break;
 		case T_ConvertRowtypeExpr:
 			type = ((ConvertRowtypeExpr *) expr)->resulttype;
 			break;
@@ -2734,6 +2872,8 @@ exprTypmod(Node *expr)
 			return ((FieldSelect *) expr)->resulttypmod;
 		case T_RelabelType:
 			return ((RelabelType *) expr)->resulttypmod;
+		case T_ArrayCoerceExpr:
+			return ((ArrayCoerceExpr *) expr)->resulttypmod;
 		case T_CaseExpr:
 			{
 				/*
@@ -2856,47 +2996,51 @@ exprTypmod(Node *expr)
 bool
 exprIsLengthCoercion(Node *expr, int32 *coercedTypmod)
 {
-	FuncExpr   *func;
-	int			nargs;
-	Const	   *second_arg;
-
 	if (coercedTypmod != NULL)
 		*coercedTypmod = -1;	/* default result on failure */
 
-	/* Is it a function-call at all? */
-	if (expr == NULL || !IsA(expr, FuncExpr))
-		return false;
-	func = (FuncExpr *) expr;
-
 	/*
-	 * If it didn't come from a coercion context, reject.
+	 * Scalar-type length coercions are FuncExprs, array-type length
+	 * coercions are ArrayCoerceExprs
 	 */
-	if (func->funcformat != COERCE_EXPLICIT_CAST &&
-		func->funcformat != COERCE_IMPLICIT_CAST)
-		return false;
+	if (expr && IsA(expr, FuncExpr))
+	{
+		FuncExpr   *func = (FuncExpr *) expr;
+		int		 nargs;
+		Const	  *second_arg;
 
-	/*
-	 * If it's not a two-argument or three-argument function with the second
-	 * argument being an int4 constant, it can't have been created from a
-	 * length coercion (it must be a type coercion, instead).
-	 */
-	nargs = list_length(func->args);
-	if (nargs < 2 || nargs > 3)
-		return false;
+		/*
+		 * If it didn't come from a coercion context, reject.
+		 */
+		if (func->funcformat != COERCE_EXPLICIT_CAST &&
+			func->funcformat != COERCE_IMPLICIT_CAST)
+			return false;
 
-	second_arg = (Const *) lsecond(func->args);
-	if (!IsA(second_arg, Const) ||
-		second_arg->consttype != INT4OID ||
-		second_arg->constisnull)
-		return false;
+		/*
+		 * If it's not a two-argument or three-argument function with the
+		 * second argument being an int4 constant, it can't have been created
+		 * from a length coercion (it must be a type coercion, instead).
+		 */
+		nargs = list_length(func->args);
+		if (nargs < 2 || nargs > 3)
+			return false;
 
-	/*
-	 * OK, it is indeed a length-coercion function.
-	 */
-	if (coercedTypmod != NULL)
-		*coercedTypmod = DatumGetInt32(second_arg->constvalue);
+		second_arg = (Const *) lsecond(func->args);
+		if (!IsA(second_arg, Const) ||
+			second_arg->consttype != INT4OID ||
+			second_arg->constisnull)
+			return false;
 
-	return true;
+		/*
+		 * OK, it is indeed a length-coercion function.
+		 */
+		if (coercedTypmod != NULL)
+			*coercedTypmod = DatumGetInt32(second_arg->constvalue);
+
+		return true;
+	}
+
+	return false;
 }
 
 /*
@@ -2906,14 +3050,14 @@ exprIsLengthCoercion(Node *expr, int32 *coercedTypmod)
  * the type name and then apply any necessary coercion function(s).
  */
 static Node *
-typecast_expression(ParseState *pstate, Node *expr, TypeName *typname)
+typecast_expression(ParseState *pstate, Node *expr, TypeName *typename)
 {
 	Oid			inputType = exprType(expr);
 	Oid			targetType;
 	int32		targetTypmod;
 
-	targetType = typenameTypeId(pstate, typname);
-	targetTypmod = typenameTypeMod(pstate, typname, targetType);
+	targetType = typenameTypeId(pstate, typename);
+	targetTypmod = typenameTypeMod(pstate, typename, targetType);
 
 	if (inputType == InvalidOid)
 		return expr;			/* do nothing if NULL input */
@@ -2929,7 +3073,7 @@ typecast_expression(ParseState *pstate, Node *expr, TypeName *typname)
 				 errmsg("cannot cast type %s to %s",
 						format_type_be(inputType),
 						format_type_be(targetType)),
-				 parser_errposition(pstate, typname->location)));
+				 parser_errposition(pstate, typename->location)));
 
 	return expr;
 }

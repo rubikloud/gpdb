@@ -7,7 +7,7 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
- *	  $PostgreSQL: pgsql/src/backend/executor/execQual.c,v 1.204 2007/01/07 22:49:55 petere Exp $
+ *	  $PostgreSQL: pgsql/src/backend/executor/execQual.c,v 1.213 2007/02/06 17:35:20 tgl Exp $
  *
  *-------------------------------------------------------------------------
  */
@@ -179,6 +179,11 @@ static Datum ExecEvalFieldStore(FieldStoreState *fstate,
 static Datum ExecEvalRelabelType(GenericExprState *exprstate,
 					ExprContext *econtext,
 					bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate, ExprContext *econtext,
+								bool *isNull, ExprDoneCond *isDone);
+static Datum ExecEvalCoerceViaIO(CoerceViaIOState *iostate,
+						ExprContext *econtext,
+						bool *isNull, ExprDoneCond *isDone);
 static Datum ExecEvalPartOidExpr(PartOidExprState *exprstate,
 						ExprContext *econtext,
 						bool *isNull, ExprDoneCond *isDone);
@@ -551,9 +556,9 @@ ExecEvalGroupId(ExprState *gstate, ExprContext *econtext,
  *		function with respect to the given context.
  *
  * XXX	Note that this routine is essentially the same as
- *      ExecEvalAggref since we use the same buffers. However,
- *      since the state structures for WindowRef and Aggref 
- *      are different, we separate the execution routines, too.
+ *		ExecEvalAggref since we use the same buffers. However,
+ *		since the state structures for WindowRef and Aggref 
+ *		are different, we separate the execution routines, too.
  * ----------------------------------------------------------------
  */
 static Datum
@@ -2050,7 +2055,7 @@ ExecMakeTableFunctionResult(ExprState *funcexpr,
 			 */
 			if (returnsTuple)
 			{
-			    const int staticBufferLimit = 200;
+				const int staticBufferLimit = 200;
 				HeapTupleHeader td;
 				Datum staticPd[staticBufferLimit];
 				bool staticNull[staticBufferLimit];
@@ -3137,10 +3142,20 @@ ExecEvalCase(CaseExprState *caseExpr, ExprContext *econtext,
 
 	if (caseExpr->arg)
 	{
+		/*
+		 * caseValue_datum and caseValue_isNull from econtext store the results of case
+		 * expression. caseValue_isNull will be true if caseValue_datum store null value.
+		 * Both caseValue_datum and caseValue_isNull should change at same time and they shouldn't
+		 * go out of sync.
+		 * Hence pass temporary variable(caseValue_isNull) and once evaluation is done,
+		 * update the caseValue_isNull from econtext.
+		 */
+		bool caseValue_isNull = false;
 		econtext->caseValue_datum = ExecEvalExpr(caseExpr->arg,
 												 econtext,
-												 &econtext->caseValue_isNull,
+												 &caseValue_isNull,
 												 NULL);
+		econtext->caseValue_isNull = caseValue_isNull;
 	}
 
 	/*
@@ -4624,6 +4639,8 @@ ExecEvalCurrentOfExpr(ExprState *exprstate, ExprContext *econtext,
 			 * If tableoid is InvalidOid, this implies that constant folding had
 			 * had determined tableoid was not necessary in uniquely identifying a tuple.
 			 * Otherwise, the given tuple's tableoid must match the CURRENT OF tableoid.
+			 * NOTE: If you are modifying this code, please modify corresponding code in
+			 * TidListCreate also.
 			 */
 			if (!OidIsValid(cexpr->tableoid) ||
 				cexpr->tableoid == slot->tts_tableOid)
@@ -4758,7 +4775,7 @@ ExecInitExpr(Expr *node, PlanState *parent)
 					if (naggs != aggstate->numaggs)
 						ereport(ERROR,
 								(errcode(ERRCODE_GROUPING_ERROR),
-								 errmsg("aggregate function calls may not be nested")));
+								 errmsg("aggregate function calls cannot be nested")));
 				}
 				else
 				{
@@ -4980,6 +4997,48 @@ ExecInitExpr(Expr *node, PlanState *parent)
 				gstate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalRelabelType;
 				gstate->arg = ExecInitExpr(relabel->arg, parent);
 				state = (ExprState *) gstate;
+			}
+			break;
+		case T_CoerceViaIO:
+			{
+				CoerceViaIO *iocoerce = (CoerceViaIO *) node;
+				CoerceViaIOState *iostate = makeNode(CoerceViaIOState);
+				Oid	 iofunc;
+				bool	typisvarlena;
+
+				iostate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalCoerceViaIO;
+				iostate->arg = ExecInitExpr(iocoerce->arg, parent);
+				/* lookup the result type's input function */
+				getTypeInputInfo(iocoerce->resulttype, &iofunc,
+								 &iostate->intypioparam);
+				fmgr_info(iofunc, &iostate->infunc);
+				/* lookup the input type's output function */
+				getTypeOutputInfo(exprType((Node *) iocoerce->arg),
+								  &iofunc, &typisvarlena);
+				fmgr_info(iofunc, &iostate->outfunc);
+				state = (ExprState *) iostate;
+			}
+			break;
+		case T_ArrayCoerceExpr:
+			{
+				ArrayCoerceExpr *acoerce = (ArrayCoerceExpr *) node;
+				ArrayCoerceExprState *astate = makeNode(ArrayCoerceExprState);
+
+				astate->xprstate.evalfunc = (ExprStateEvalFunc) ExecEvalArrayCoerceExpr;
+				astate->arg = ExecInitExpr(acoerce->arg, parent);
+				astate->resultelemtype = get_element_type(acoerce->resulttype);
+				if (astate->resultelemtype == InvalidOid)
+				{
+						ereport(ERROR,
+										(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+										 errmsg("target type is not an array")));
+				}
+				/* Arrays over domains aren't supported yet */
+				Assert(getBaseType(astate->resultelemtype) ==
+						   astate->resultelemtype);
+				astate->elemfunc.fn_oid = InvalidOid;   /* not initialized */
+				astate->amstate = (ArrayMapState *) palloc0(sizeof(ArrayMapState));
+				state = (ExprState *) astate;
 			}
 			break;
 		case T_ConvertRowtypeExpr:
@@ -5803,7 +5862,10 @@ ExecTargetList(List *targetlist,
  *
  * Results are stored into the passed values and isnull arrays.
  */
-static void
+#ifndef USE_CODEGEN
+static
+#endif
+void
 ExecVariableList(ProjectionInfo *projInfo,
 				 Datum *values,
 				 bool *isnull)
@@ -5872,7 +5934,7 @@ ExecProject(ProjectionInfo *projInfo, ExprDoneCond *isDone)
 		if (isDone)
 			*isDone = ExprSingleResult;
 
-		ExecVariableList(projInfo,
+		call_ExecVariableList(projInfo,
 						 slot_get_values(slot),
 						 slot_get_isnull(slot));
 		ExecStoreVirtualTuple(slot);
@@ -6071,4 +6133,114 @@ isJoinExprNull(List *joinExpr, ExprContext *econtext)
 	}
 
 	return joinkeys_null;
+}
+
+
+/* ----------------------------------------------------------------
+ *	  ExecEvalCoerceViaIO
+ *
+ *	  Evaluate a CoerceViaIO node.
+ * ----------------------------------------------------------------
+ */
+static Datum
+ExecEvalCoerceViaIO(CoerceViaIOState *iostate,
+					ExprContext *econtext,
+					bool *isNull, ExprDoneCond *isDone)
+{
+	Datum	   result;
+	Datum	   inputval;
+	char	   *string;
+
+	inputval = ExecEvalExpr(iostate->arg, econtext, isNull, isDone);
+
+	if (isDone && *isDone == ExprEndResult)
+		return inputval;		/* nothing to do */
+
+	if (*isNull)
+		string = NULL;		  /* output functions are not called on nulls */
+	else
+	string = OutputFunctionCall(&iostate->outfunc, inputval);
+
+	result = InputFunctionCall(&iostate->infunc,
+							   string,
+							   iostate->intypioparam,
+							   -1);
+
+	/* The input function cannot change the null/not-null status */
+	return result;
+}
+
+/* ----------------------------------------------------------------
+ *			  ExecEvalArrayCoerceExpr
+ *
+ *			  Evaluate an ArrayCoerceExpr node.
+ * ----------------------------------------------------------------
+ */
+static Datum
+ExecEvalArrayCoerceExpr(ArrayCoerceExprState *astate,
+												ExprContext *econtext,
+												bool *isNull, ExprDoneCond *isDone)
+{
+	ArrayCoerceExpr *acoerce = (ArrayCoerceExpr *) astate->xprstate.expr;
+	Datum		   result;
+	ArrayType  *array;
+	FunctionCallInfoData locfcinfo;
+
+	result = ExecEvalExpr(astate->arg, econtext, isNull, isDone);
+
+	if (isDone && *isDone == ExprEndResult)
+			return result;				  /* nothing to do */
+	if (*isNull)
+			return result;				  /* nothing to do */
+
+	/*
+	 * If it's binary-compatible, modify the element type in the array header,
+	 * but otherwise leave the array as we received it.
+	 */
+	if (!OidIsValid(acoerce->elemfuncid))
+	{
+			/* Detoast input array if necessary, and copy in any case */
+			array = DatumGetArrayTypePCopy(result);
+			ARR_ELEMTYPE(array) = astate->resultelemtype;
+			PG_RETURN_ARRAYTYPE_P(array);
+	}
+
+	/* Detoast input array if necessary, but don't make a useless copy */
+	array = DatumGetArrayTypeP(result);
+	/* Initialize function cache if first time through */
+	if (astate->elemfunc.fn_oid == InvalidOid)
+	{
+			AclResult	   aclresult;
+
+			/* Check permission to call function */
+			aclresult = pg_proc_aclcheck(acoerce->elemfuncid, GetUserId(),
+																	 ACL_EXECUTE);
+			if (aclresult != ACLCHECK_OK)
+					aclcheck_error(aclresult, ACL_KIND_PROC,
+											   get_func_name(acoerce->elemfuncid));
+
+			/* Set up the primary fmgr lookup information */
+			fmgr_info_cxt(acoerce->elemfuncid, &(astate->elemfunc),
+									  econtext->ecxt_per_query_memory);
+
+			/* Initialize additional info */
+			astate->elemfunc.fn_expr = (Node *) acoerce;
+	}
+	/*
+	 * Use array_map to apply the function to each array element.
+	 *
+	 * We pass on the desttypmod and isExplicit flags whether or not the
+	 * function wants them.
+	 */
+	InitFunctionCallInfoData(locfcinfo, &(astate->elemfunc), 3,
+													 NULL, NULL);
+	locfcinfo.arg[0] = PointerGetDatum(array);
+	locfcinfo.arg[1] = Int32GetDatum(acoerce->resulttypmod);
+	locfcinfo.arg[2] = BoolGetDatum(acoerce->isExplicit);
+	locfcinfo.argnull[0] = false;
+	locfcinfo.argnull[1] = false;
+	locfcinfo.argnull[2] = false;
+
+	return array_map(&locfcinfo, ARR_ELEMTYPE(array), astate->resultelemtype,
+									 astate->amstate);
 }
