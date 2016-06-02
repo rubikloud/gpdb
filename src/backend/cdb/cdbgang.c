@@ -68,8 +68,7 @@ static List *availableReaderGangs1 = NIL;
 static Gang *primaryWriterGang = NULL;
 
 /*
- * Every gang created must have a unique identifier, so the QD and Dispatch Agents can agree
- * about what they are talking about.
+ * Every gang created must have a unique identifier
  */
 #define PRIMARY_WRITER_GANG_ID 1
 static int gang_id_counter = 2;
@@ -1895,6 +1894,7 @@ void freeGangsForPortal(char *portal_name)
 	while (cur_item != NULL)
 	{
 		Gang *gp = (Gang *) lfirst(cur_item);
+		ListCell *next_item = lnext(cur_item);
 
 		if (isTargetPortal(gp->portal_name, portal_name))
 		{
@@ -1910,10 +1910,7 @@ void freeGangsForPortal(char *portal_name)
 			else
 				disconnectAndDestroyGang(gp);
 
-			if (prev_item)
-				cur_item = lnext(prev_item);
-			else
-				cur_item = list_head(allocatedReaderGangsN);
+			cur_item = next_item;
 		}
 		else
 		{
@@ -1921,14 +1918,16 @@ void freeGangsForPortal(char *portal_name)
 
 			/* cur_item must be preserved */
 			prev_item = cur_item;
-			cur_item = lnext(prev_item);
+			cur_item = next_item;
 		}
 	}
 
+	prev_item = NULL;
 	cur_item = list_head(allocatedReaderGangs1);
 	while (cur_item != NULL)
 	{
 		Gang *gp = (Gang *) lfirst(cur_item);
+		ListCell *next_item = lnext(cur_item);
 
 		if (isTargetPortal(gp->portal_name, portal_name))
 		{
@@ -1944,10 +1943,7 @@ void freeGangsForPortal(char *portal_name)
 			else
 				disconnectAndDestroyGang(gp);
 
-			if (prev_item)
-				cur_item = lnext(prev_item);
-			else
-				cur_item = list_head(allocatedReaderGangs1);
+			cur_item = next_item;
 		}
 		else
 		{
@@ -1955,7 +1951,7 @@ void freeGangsForPortal(char *portal_name)
 
 			/* cur_item must be preserved */
 			prev_item = cur_item;
-			cur_item = lnext(prev_item);
+			cur_item = next_item;
 		}
 	}
 

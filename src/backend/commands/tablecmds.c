@@ -1296,7 +1296,7 @@ DefinePartitionedRelation(CreateStmt *stmt, Oid relOid)
 
 				ProcessUtility((Node *)(((Query *)pUtl)->utilityStmt),
 							   synthetic_sql,
-							   NULL, 
+							   NULL,
 							   false, /* not top level */
 							   dest,
 							   NULL);
@@ -1338,7 +1338,7 @@ EvaluateDeferredStatements(List *deferredStmts)
 			uquery = (Query*)utilityStmt;
 			Insist(uquery->commandType == CMD_UTILITY);
 			
-			ereport(DEBUG1, 
+			ereport(DEBUG1,
 					(errmsg("processing deferred utility statement")));
 			
 			ProcessUtility((Node*)uquery->utilityStmt,
@@ -6530,24 +6530,31 @@ find_composite_type_dependencies(Oid typeOid,
 								 const char *origTblName,
 								 const char *origTypeName)
 {
-	cqContext  *pcqCtx;
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc depScan;
 	HeapTuple	depTup;
-	Oid         arrayOid;
+	Oid			arrayOid;
 
 	/*
 	 * We scan pg_depend to find those things that depend on the rowtype. (We
 	 * assume we can ignore refobjsubid for a rowtype.)
 	 */
+	depRel = heap_open(DependRelationId, AccessShareLock);
 
-	pcqCtx = caql_beginscan(
-			NULL,
-			cql("SELECT * FROM pg_depend "
-				" WHERE refclassid = :1 "
-				" AND refobjid = :2 ",
-				ObjectIdGetDatum(TypeRelationId),
-				ObjectIdGetDatum(typeOid)));
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(TypeRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typeOid));
 
-	while (HeapTupleIsValid(depTup = caql_getnext(pcqCtx)))
+	depScan = systable_beginscan(depRel, DependReferenceIndexId, true,
+								 SnapshotNow, 2, key);
+
+	while (HeapTupleIsValid(depTup = systable_getnext(depScan)))
 	{
 		Form_pg_depend pg_depend = (Form_pg_depend) GETSTRUCT(depTup);
 		Relation	rel;
@@ -6591,7 +6598,10 @@ find_composite_type_dependencies(Oid typeOid,
 
 		relation_close(rel, AccessShareLock);
 	}
-	caql_endscan(pcqCtx);
+
+	systable_endscan(depScan);
+
+	relation_close(depRel, AccessShareLock);
 
 	/*
 	 * If there's an array type for the rowtype, must check for uses of it,
@@ -6599,7 +6609,7 @@ find_composite_type_dependencies(Oid typeOid,
 	 */
 	arrayOid = get_array_type(typeOid);
 	if (OidIsValid(arrayOid))
-		find_composite_type_dependencies(arrayOid, origTblName, NULL);
+		find_composite_type_dependencies(arrayOid, origTblName, origTypeName);
 }
 
 
@@ -7946,11 +7956,11 @@ ATExecAddIndex(AlteredTableInfo *tab, Relation rel,
 
 			heap_close(crel, AccessShareLock); /* already locked master */
 
-			ProcessUtility((Node *)ats, 
+			ProcessUtility((Node *)ats,
 						   synthetic_sql,
-						   NULL, 
+						   NULL,
 						   false, /* not top level */
-						   dest, 
+						   dest,
 						   NULL);
 		}
 	}
@@ -8518,7 +8528,6 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 	bool		isnull;
 	oidvector  *indclass;
 	int			i;
-	cqContext  *pcqCtx = NULL;
 
 	/*
 	 * Get the list of index OIDs for the table from the relcache, and look up
@@ -8533,14 +8542,9 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 	{
 		Oid			indexoid = lfirst_oid(indexoidscan);
 
-		pcqCtx = caql_beginscan(
-				NULL,
-				cql("SELECT * FROM pg_index "
-					" WHERE indexrelid = :1 ",
-					ObjectIdGetDatum(indexoid)));
-
-		indexTuple = caql_getnext(pcqCtx);
-
+		indexTuple = SearchSysCache(INDEXRELID,
+									ObjectIdGetDatum(indexoid),
+									0, 0, 0);
 		if (!HeapTupleIsValid(indexTuple))
 			elog(ERROR, "cache lookup failed for index %u", indexoid);
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
@@ -8549,7 +8553,7 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 			*indexOid = indexoid;
 			break;
 		}
-		caql_endscan(pcqCtx);
+		ReleaseSysCache(indexTuple);
 	}
 
 	list_free(indexoidlist);
@@ -8564,8 +8568,8 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 						RelationGetRelationName(pkrel))));
 
 	/* Must get indclass the hard way */
-	indclassDatum = caql_getattr(pcqCtx,
-								 Anum_pg_index_indclass, &isnull);
+	indclassDatum = SysCacheGetAttr(INDEXRELID, indexTuple,
+									Anum_pg_index_indclass, &isnull);
 	Assert(!isnull);
 	indclass = (oidvector *) DatumGetPointer(indclassDatum);
 
@@ -8585,7 +8589,7 @@ transformFkeyGetPrimaryKey(Relation pkrel, Oid *indexOid,
 			   makeString(pstrdup(NameStr(*attnumAttName(pkrel, pkattno)))));
 	}
 
-	caql_endscan(pcqCtx);
+	ReleaseSysCache(indexTuple);
 
 	return i;
 }
@@ -8618,20 +8622,14 @@ transformFkeyCheckAttrs(Relation pkrel,
 	foreach(indexoidscan, indexoidlist)
 	{
 		HeapTuple	indexTuple;
-		cqContext  *pcqCtx;
 		Form_pg_index indexStruct;
 		int			i,
 					j;
 
 		indexoid = lfirst_oid(indexoidscan);
-		pcqCtx = caql_beginscan(
-				NULL,
-				cql("SELECT * FROM pg_index "
-					" WHERE indexrelid = :1 ",
-					ObjectIdGetDatum(indexoid)));
-
-		indexTuple = caql_getnext(pcqCtx);
-
+		indexTuple = SearchSysCache(INDEXRELID,
+									ObjectIdGetDatum(indexoid),
+									0, 0, 0);
 		if (!HeapTupleIsValid(indexTuple))
 			elog(ERROR, "cache lookup failed for index %u", indexoid);
 		indexStruct = (Form_pg_index) GETSTRUCT(indexTuple);
@@ -8650,8 +8648,8 @@ transformFkeyCheckAttrs(Relation pkrel,
 			bool		isnull;
 			oidvector  *indclass;
 
-			indclassDatum = caql_getattr(pcqCtx,
-										 Anum_pg_index_indclass, &isnull);
+			indclassDatum = SysCacheGetAttr(INDEXRELID, indexTuple,
+											Anum_pg_index_indclass, &isnull);
 			Assert(!isnull);
 			indclass = (oidvector *) DatumGetPointer(indclassDatum);
 
@@ -8692,10 +8690,10 @@ transformFkeyCheckAttrs(Relation pkrel,
 				}
 			}
 		}
-		caql_endscan(pcqCtx);
+		ReleaseSysCache(indexTuple);
 		if (found)
 			break;
-	} /* end foreach(indexoidscan, indexoidlist) */
+	}
 
 	if (!found)
 		ereport(ERROR,
@@ -10405,19 +10403,12 @@ ATExecSetRelOptions(Relation rel, List *defList, bool isReset)
 static void 
 copy_append_only_data(
 	RelFileNode		*oldRelFileNode,
-	
 	RelFileNode		*newRelFileNode,
-	
 	int32			segmentFileNum,
-
 	char			*relationName,
-
 	int64			eof,
-
 	ItemPointer		persistentTid,
-	
 	int64			persistentSerialNum,
-	
 	char			*buffer)
 {
 	MIRRORED_LOCK_DECLARE;
@@ -11220,16 +11211,9 @@ ATExecSetTableSpace(Oid tableOid, Oid newTableSpace, TableOidInfo *oidInfo)
  * Copy data, block by block
  */
 static void
-copy_buffer_pool_data(
-	Relation 	rel,
-
-	SMgrRelation dst,
-
-	ItemPointer persistentTid,
-
-	int64 		persistentSerialNum,
-
-	bool		useWal)
+copy_buffer_pool_data(Relation rel, SMgrRelation dst,
+					  ItemPointer persistentTid, int64 persistentSerialNum,
+					  bool useWal)
 {
 	SMgrRelation src;
 	BlockNumber nblocks;
@@ -12397,11 +12381,11 @@ build_hidden_type(Form_pg_attribute att)
 	parsetrees = parse_analyze((Node *)newtype, NULL, NULL, 0);
 	Assert(list_length(parsetrees) == 1);
 	q = (Query *)linitial(parsetrees);
-	ProcessUtility((Node *)q->utilityStmt, 
+	ProcessUtility((Node *)q->utilityStmt,
 				   synthetic_sql,
-				   NULL, 
+				   NULL,
 				   false, /* not top level */
-				   dest, 
+				   dest,
 				   NULL);
 	CommandCounterIncrement();
 
@@ -12412,11 +12396,11 @@ build_hidden_type(Form_pg_attribute att)
 	inputname = copyObject(linitial(iofunc->funcname));
 	parsetrees = parse_analyze((Node *)iofunc, NULL, NULL, 0);
 	q = (Query *)linitial(parsetrees);
-	ProcessUtility((Node *)q->utilityStmt, 
+	ProcessUtility((Node *)q->utilityStmt,
 				   synthetic_sql,
-				   NULL, 
+				   NULL,
 				   false, /* not top level */
-				   dest, 
+				   dest,
 				   NULL);
 	CommandCounterIncrement();
 
@@ -12428,9 +12412,9 @@ build_hidden_type(Form_pg_attribute att)
 	q = (Query *)linitial(parsetrees);
 	ProcessUtility((Node *)q->utilityStmt,
 				   synthetic_sql,
-				   NULL, 
+				   NULL,
 				   false, /* not top level */
-				   dest, 
+				   dest,
 				   NULL);
 	CommandCounterIncrement();
 
@@ -12471,9 +12455,9 @@ build_hidden_type(Form_pg_attribute att)
 	q = (Query *)linitial(parsetrees);
 	ProcessUtility((Node *)q->utilityStmt,
 				   synthetic_sql,
-				   NULL, 
+				   NULL,
 				   false, /* not top level */
-				   dest, 
+				   dest,
 				   NULL);
 	CommandCounterIncrement();
 
@@ -12785,11 +12769,11 @@ prebuild_temp_table(Relation rel, RangeVar *tmpname, List *distro, List *opts,
 		parsetrees = parse_analyze((Node *)cs, NULL, NULL, 0);
 		Assert(list_length(parsetrees) == 1);
 		q = (Query *)linitial(parsetrees);
-		ProcessUtility((Node *)q->utilityStmt, 
+		ProcessUtility((Node *)q->utilityStmt,
 					   synthetic_sql,
-					   NULL, 
+					   NULL,
 					   false, /* not top level */
-					   dest, 
+					   dest,
 					   NULL);
 		CommandCounterIncrement();
 
@@ -12821,11 +12805,11 @@ prebuild_temp_table(Relation rel, RangeVar *tmpname, List *distro, List *opts,
 			parsetrees = parse_analyze((Node *)ats, NULL, NULL, 0);
 			Assert(list_length(parsetrees) == 1);
 			q = (Query *)linitial(parsetrees);
-			ProcessUtility((Node *)q->utilityStmt, 
+			ProcessUtility((Node *)q->utilityStmt,
 						   synthetic_sql,
-						   NULL, 
+						   NULL,
 						   false, /* not top level */
-						   dest, 
+						   dest,
 						   NULL);
 			CommandCounterIncrement();
 		}
@@ -14343,9 +14327,9 @@ ATPExecPartDrop(Relation rel,
 
 		ProcessUtility((Node *) ds,
 					   synthetic_sql,
-					   NULL, 
+					   NULL,
 					   false, /* not top level */
-					   dest, 
+					   dest,
 					   NULL);
 
 		/* Notify of name if did not use name for partition id spec */
@@ -15074,7 +15058,7 @@ ATPExecPartRename(Relation rel,
 					   synthetic_sql,
 					   NULL,
 					   false, /* not top level */
-					   dest, 
+					   dest,
 					   NULL);
 
 		/* process children if there are any */
@@ -15095,9 +15079,9 @@ ATPExecPartRename(Relation rel,
 
 				ProcessUtility((Node *) renStmt,
 							   synthetic_sql,
-							   NULL, 
+							   NULL,
 							   false, /* not top level */
-							   dest, 
+							   dest,
 							   NULL);
 				renamed++;
 			}
@@ -16025,7 +16009,7 @@ ATPExecPartSplit(Relation *rel,
 					   synthetic_sql,
 					   NULL,
 					   false, /* not top level */
-					   dest, 
+					   dest,
 					   NULL);
 		CommandCounterIncrement();
 
@@ -16069,9 +16053,9 @@ ATPExecPartSplit(Relation *rel,
 		heap_close(*rel, NoLock);
 		ProcessUtility((Node *)q->utilityStmt,
 					   synthetic_sql,
-					   NULL, 
+					   NULL,
 					   false, /* not top level */
-					   dest, 
+					   dest,
 					   NULL);
 		*rel = heap_open(relid, AccessExclusiveLock);
 		CommandCounterIncrement();
@@ -16130,11 +16114,11 @@ ATPExecPartSplit(Relation *rel,
 		{
 			q = (Query *)lfirst(lc);
 
-			ProcessUtility((Node *)q->utilityStmt, 
+			ProcessUtility((Node *)q->utilityStmt,
 						   synthetic_sql,
-						   NULL, 
+						   NULL,
 						   false, /* not top level */
-						   dest, 
+						   dest,
 						   NULL);
 		}
 
@@ -16494,11 +16478,11 @@ ATPExecPartSplit(Relation *rel,
 			q = (Query *)linitial(parsetrees);
 
 			heap_close(*rel, NoLock);
-			ProcessUtility((Node *)q->utilityStmt, 
+			ProcessUtility((Node *)q->utilityStmt,
 						   synthetic_sql,
-						   NULL, 
+						   NULL,
 						   false, /* not top level */
-						   dest, 
+						   dest,
 						   NULL);
 			*rel = heap_open(relid, AccessExclusiveLock);
 
@@ -16763,9 +16747,9 @@ ATPExecPartTruncate(Relation rel,
 
 		ProcessUtility( (Node *) ts,
 					   synthetic_sql,
-					   NULL, 
+					   NULL,
 					   false, /* not top level */
-					   dest, 
+					   dest,
 					   NULL);
 
 		/* Notify of name if did not use name for partition id spec */
@@ -16893,8 +16877,7 @@ AlterTableNamespace(RangeVar *relation, const char *newschema)
 }
 
 static void
-AlterRelationNamespaceInternalTwo(Relation rel,
-								  Oid relid,
+AlterRelationNamespaceInternalTwo(Relation rel, Oid relid,
 								  Oid oldNspOid, Oid newNspOid,
 								  bool hasDependEntry,
 								  const char *newschema)

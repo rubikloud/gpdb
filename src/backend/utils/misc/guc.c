@@ -50,7 +50,6 @@
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
 #include "postmaster/bgwriter.h"
-#include "postmaster/checkpoint.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "replication/walsender.h"
@@ -1257,11 +1256,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_UNIT_KB | GUC_GPDB_ADDOPT
 		},
 		&work_mem,
-#ifdef USE_ASSERT_CHECKING      /* allow executor testing with low memory */
-        32768, 2 * BLCKSZ / 1024, MAX_KILOBYTES, NULL, NULL
-#else
-		32768, 8 * BLCKSZ / 1024, MAX_KILOBYTES, NULL, NULL
-#endif
+        32768, 64, MAX_KILOBYTES, NULL, NULL
 	},
 
 	{
