@@ -1,6 +1,12 @@
 #!/bin/bash
 
+# Do not change/comment out the following statement
+# Avoids conflict with upstream synch and helps to keep track of upstream major.minor
 GP_VERSION=4.3.99.00
+
+# Override for RK versioning and force the '-RK' suffix.
+GP_VERSION=4.3.160602.00
+GP_VERSION_SUFFIX="-RK${GP_VERSION_SUFFIX}"
 
 # Pickup environment variable for suffix.
 # This allows team branches to look like a special build.
@@ -8,7 +14,8 @@ if [ -n "${GP_VERSION_SUFFIX}" ] ; then
     GP_VERSION=${GP_VERSION}${GP_VERSION_SUFFIX}
 fi
 
-GP_BUILDNUMBER=dev
+GP_BUILDNUMBER="B`date +%s`"
+
 if [ -f BUILD_NUMBER ] ; then
     GP_BUILDNUMBER=`cat BUILD_NUMBER`
 fi
